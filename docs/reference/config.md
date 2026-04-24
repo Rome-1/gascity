@@ -435,6 +435,8 @@ ProviderPatch modifies an existing provider identified by Name.
 | `base` | string |  |  | Base overrides the provider's inheritance parent (presence-aware). Pointer to a pointer so the patch can distinguish "no change" (double-nil) from "clear to inherit default" (single-nil value in outer pointer) from "set to explicit empty opt-out" (value "" in inner pointer) from "set to &lt;name&gt;". Callers use:   nil          = patch does not touch Base   &(*string)(nil) = patch clears Base to absent   &(&"")       = patch sets Base = "" (explicit opt-out)   &(&"builtin:codex") = patch sets Base to that value |
 | `command` | string |  |  | Command overrides the provider command. |
 | `args` | []string |  |  | Args overrides the provider args. |
+| `acp_command` | string |  |  | ACPCommand overrides the provider's ACP-mode command. |
+| `acp_args` | []string |  |  | ACPArgs overrides the provider's ACP-mode args. An explicit empty list is not representable through a patch — use a city-level [providers.X] block if you need to clear ACPArgs. |
 | `args_append` | []string |  |  | ArgsAppend overrides the provider args_append list. |
 | `options_schema_merge` | string |  |  | OptionsSchemaMerge overrides the options_schema merge mode. |
 | `prompt_mode` | string |  |  | PromptMode overrides prompt delivery mode. Enum: `arg`, `flag`, `none` |
@@ -456,6 +458,8 @@ ProviderSpec defines a named provider's startup parameters.
 | `display_name` | string |  |  | DisplayName is the human-readable name shown in UI and logs. |
 | `command` | string |  |  | Command is the executable to run for this provider. |
 | `args` | []string |  |  | Args are default command-line arguments passed to the provider. |
+| `acp_command` | string |  |  | ACPCommand overrides Command when the agent runs with session="acp". Empty means "reuse Command for ACP too" (correct for providers that auto-detect ACP on stdin, e.g. Claude Code). Providers that need a distinct subcommand in ACP mode set it explicitly so tmux transport keeps a usable interactive command. Example: "opencode" with ACPArgs = ["acp"] for OpenCode. |
+| `acp_args` | []string |  |  | ACPArgs overrides Args under session="acp". A nil/absent value means "reuse Args"; an explicit empty list means "no args in ACP mode". |
 | `prompt_mode` | string |  | `arg` | PromptMode controls how prompts are delivered: "arg", "flag", or "none". Enum: `arg`, `flag`, `none` |
 | `prompt_flag` | string |  |  | PromptFlag is the CLI flag used when prompt_mode is "flag" (e.g. "--prompt"). |
 | `ready_delay_ms` | integer |  |  | ReadyDelayMs is milliseconds to wait after launch before the provider is considered ready. |

@@ -32,9 +32,18 @@ type BuiltinOptionChoice struct {
 //
 //nolint:revive // Mirrors the config boundary naming intentionally.
 type BuiltinProviderSpec struct {
-	DisplayName            string
-	Command                string
-	Args                   []string
+	DisplayName string
+	Command     string
+	Args        []string
+	// ACPCommand overrides Command when the agent runs with session="acp".
+	// Empty means "reuse Command for ACP too" — correct for providers that
+	// auto-detect ACP on stdin (e.g. Claude Code). Providers that need a
+	// distinct subcommand in ACP mode (e.g. OpenCode's `opencode acp`) set
+	// it explicitly so tmux transport keeps a usable interactive command.
+	ACPCommand string
+	// ACPArgs overrides Args under session="acp" when non-nil. A nil slice
+	// means "reuse Args"; an empty slice means "no args in ACP mode".
+	ACPArgs                []string
 	PromptMode             string
 	PromptFlag             string
 	ReadyDelayMs           int
@@ -292,9 +301,15 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		InstructionsFile: "AGENTS.md",
 	},
 	"opencode": {
-		DisplayName:      "OpenCode",
-		Command:          "opencode",
-		Args:             []string{},
+		DisplayName: "OpenCode",
+		Command:     "opencode",
+		Args:        []string{},
+		// OpenCode's BubbleTea TUI is the interactive entrypoint; its ACP
+		// server lives behind `opencode acp`. Use the subcommand for ACP
+		// sessions and leave plain `opencode` for tmux so the pane is
+		// actually interactive.
+		ACPCommand:       "opencode",
+		ACPArgs:          []string{"acp"},
 		PromptMode:       "none",
 		ReadyDelayMs:     8000,
 		ProcessNames:     []string{"opencode", "node", "bun"},
@@ -383,6 +398,7 @@ func newProfileIdentity(profile, family, transport string) ProfileIdentity {
 
 func cloneBuiltinProviderSpec(spec BuiltinProviderSpec) BuiltinProviderSpec {
 	spec.Args = cloneStrings(spec.Args)
+	spec.ACPArgs = cloneStrings(spec.ACPArgs)
 	spec.ProcessNames = cloneStrings(spec.ProcessNames)
 	spec.Env = cloneStringMap(spec.Env)
 	spec.PermissionModes = cloneStringMap(spec.PermissionModes)

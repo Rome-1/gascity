@@ -1498,6 +1498,17 @@
           "type": "array",
           "description": "Args overrides the provider args."
         },
+        "acp_command": {
+          "type": "string",
+          "description": "ACPCommand overrides the provider's ACP-mode command."
+        },
+        "acp_args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "ACPArgs overrides the provider's ACP-mode args. An explicit empty\nlist is not representable through a patch — use a city-level\n[providers.X] block if you need to clear ACPArgs."
+        },
         "args_append": {
           "items": {
             "type": "string"
@@ -1588,6 +1599,17 @@
           },
           "type": "array",
           "description": "Args are default command-line arguments passed to the provider."
+        },
+        "acp_command": {
+          "type": "string",
+          "description": "ACPCommand overrides Command when the agent runs with session=\"acp\".\nEmpty means \"reuse Command for ACP too\" (correct for providers that\nauto-detect ACP on stdin, e.g. Claude Code). Providers that need a\ndistinct subcommand in ACP mode set it explicitly so tmux transport\nkeeps a usable interactive command. Example: \"opencode\" with\nACPArgs = [\"acp\"] for OpenCode."
+        },
+        "acp_args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "ACPArgs overrides Args under session=\"acp\". A nil/absent value means\n\"reuse Args\"; an explicit empty list means \"no args in ACP mode\"."
         },
         "prompt_mode": {
           "type": "string",

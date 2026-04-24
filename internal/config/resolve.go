@@ -205,6 +205,9 @@ func MergeProviderOverBuiltin(base, city ProviderSpec) ProviderSpec {
 	if city.Command != "" {
 		result.Command = city.Command
 	}
+	if city.ACPCommand != "" {
+		result.ACPCommand = city.ACPCommand
+	}
 	if city.PromptMode != "" {
 		result.PromptMode = city.PromptMode
 	}
@@ -254,6 +257,9 @@ func MergeProviderOverBuiltin(base, city ProviderSpec) ProviderSpec {
 	// Slice fields: replace entirely when non-nil.
 	if city.Args != nil {
 		result.Args = city.Args
+	}
+	if city.ACPArgs != nil {
+		result.ACPArgs = city.ACPArgs
 	}
 	if city.ArgsAppend != nil {
 		result.ArgsAppend = append(append([]string(nil), base.ArgsAppend...), city.ArgsAppend...)
@@ -473,6 +479,7 @@ func specToResolved(name string, spec *ProviderSpec) *ResolvedProvider {
 	rp := &ResolvedProvider{
 		Name:                   name,
 		Command:                spec.Command,
+		ACPCommand:             spec.ACPCommand,
 		PromptMode:             spec.PromptMode,
 		PromptFlag:             spec.PromptFlag,
 		ReadyDelayMs:           spec.ReadyDelayMs,
@@ -512,6 +519,13 @@ func specToResolved(name string, spec *ProviderSpec) *ResolvedProvider {
 	if len(spec.Args) > 0 {
 		rp.Args = make([]string, len(spec.Args))
 		copy(rp.Args, spec.Args)
+	}
+	// ACPArgs: preserve nil-vs-empty distinction. A non-nil ACPArgs
+	// (including an explicit []) means "use this for ACP"; nil means
+	// "reuse Args".
+	if spec.ACPArgs != nil {
+		rp.ACPArgs = make([]string, len(spec.ACPArgs))
+		copy(rp.ACPArgs, spec.ACPArgs)
 	}
 
 	// Strip schema-managed flags from Args. This handles backward compatibility:
@@ -652,6 +666,12 @@ func resolvedChainToSpec(r ResolvedProvider, leaf ProviderSpec) ProviderSpec {
 	out.Command = r.Command
 	if r.Args != nil {
 		out.Args = append([]string(nil), r.Args...)
+	}
+	if r.ACPCommand != "" {
+		out.ACPCommand = r.ACPCommand
+	}
+	if r.ACPArgs != nil {
+		out.ACPArgs = append([]string(nil), r.ACPArgs...)
 	}
 	if r.PromptMode != "" {
 		out.PromptMode = r.PromptMode

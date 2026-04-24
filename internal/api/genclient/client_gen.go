@@ -1813,6 +1813,8 @@ type ProviderOptionDTO struct {
 
 // ProviderPatch defines model for ProviderPatch.
 type ProviderPatch struct {
+	ACPArgs            *[]string         `json:"ACPArgs"`
+	ACPCommand         *string           `json:"ACPCommand"`
 	Args               *[]string         `json:"Args"`
 	ArgsAppend         *[]string         `json:"ArgsAppend"`
 	Base               *string           `json:"Base"`

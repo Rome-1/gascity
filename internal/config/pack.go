@@ -1552,6 +1552,11 @@ func deepCopyProviderSpecs(in map[string]ProviderSpec) map[string]ProviderSpec {
 func deepCopyProviderSpec(in ProviderSpec) ProviderSpec {
 	out := in
 	out.Args = append([]string(nil), in.Args...)
+	// ACPArgs preserves nil-vs-empty: nil means "reuse Args" and must
+	// survive the copy, so don't widen a nil slice to an empty one.
+	if in.ACPArgs != nil {
+		out.ACPArgs = append([]string(nil), in.ACPArgs...)
+	}
 	out.ArgsAppend = append([]string(nil), in.ArgsAppend...)
 	out.ProcessNames = append([]string(nil), in.ProcessNames...)
 	out.Env = deepCopyStringMap(in.Env)

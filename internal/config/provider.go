@@ -52,6 +52,16 @@ type ProviderSpec struct {
 	Command string `toml:"command,omitempty"`
 	// Args are default command-line arguments passed to the provider.
 	Args []string `toml:"args,omitempty"`
+	// ACPCommand overrides Command when the agent runs with session="acp".
+	// Empty means "reuse Command for ACP too" (correct for providers that
+	// auto-detect ACP on stdin, e.g. Claude Code). Providers that need a
+	// distinct subcommand in ACP mode set it explicitly so tmux transport
+	// keeps a usable interactive command. Example: "opencode" with
+	// ACPArgs = ["acp"] for OpenCode.
+	ACPCommand string `toml:"acp_command,omitempty"`
+	// ACPArgs overrides Args under session="acp". A nil/absent value means
+	// "reuse Args"; an explicit empty list means "no args in ACP mode".
+	ACPArgs []string `toml:"acp_args,omitempty"`
 	// PromptMode controls how prompts are delivered: "arg", "flag", or "none".
 	PromptMode string `toml:"prompt_mode,omitempty" jsonschema:"enum=arg,enum=flag,enum=none,default=arg"`
 	// PromptFlag is the CLI flag used when prompt_mode is "flag" (e.g. "--prompt").
@@ -166,9 +176,14 @@ type ResolvedProvider struct {
 	// Chain records the resolved ancestry from leaf (index 0) to root.
 	Chain []HopIdentity
 	// Provenance records per-field and per-map-key layer attribution.
-	Provenance             ProviderProvenance
-	Command                string
-	Args                   []string
+	Provenance ProviderProvenance
+	Command    string
+	Args       []string
+	// ACPCommand / ACPArgs mirror the ProviderSpec fields. See
+	// CommandStringForTransport for how they are picked over Command/Args
+	// when a session uses the ACP transport.
+	ACPCommand             string
+	ACPArgs                []string
 	PromptMode             string
 	PromptFlag             string
 	ReadyDelayMs           int
@@ -195,11 +210,39 @@ type ResolvedProvider struct {
 }
 
 // CommandString returns the full command line: command followed by args.
+// It is equivalent to CommandStringForTransport(false) and exists for
+// call sites that do not yet care about the ACP vs tmux split.
 func (rp *ResolvedProvider) CommandString() string {
-	if len(rp.Args) == 0 {
-		return rp.Command
+	return rp.CommandStringForTransport(false)
+}
+
+// CommandStringForTransport returns the full command line, selecting
+// ACPCommand/ACPArgs when isACP is true and they are configured.
+//
+// A provider may configure neither (single command serves both
+// transports, e.g. Claude Code), Command only (tmux-only), or both
+// (OpenCode: `opencode` for tmux, `opencode acp` for ACP). When isACP
+// is true we use ACPCommand if set and ACPArgs if non-nil; missing
+// fields fall back to Command/Args respectively. This split matters for
+// providers whose ACP-mode entrypoint is a subcommand — invoking the
+// tmux command in ACP mode yields a headless JSON-RPC server stuck in
+// a terminal pane, and invoking the ACP subcommand in tmux mode yields
+// an uninteractive server with no prompt.
+func (rp *ResolvedProvider) CommandStringForTransport(isACP bool) string {
+	cmd := rp.Command
+	args := rp.Args
+	if isACP {
+		if rp.ACPCommand != "" {
+			cmd = rp.ACPCommand
+		}
+		if rp.ACPArgs != nil {
+			args = rp.ACPArgs
+		}
 	}
-	return rp.Command + " " + shellquote.Join(rp.Args)
+	if len(args) == 0 {
+		return cmd
+	}
+	return cmd + " " + shellquote.Join(args)
 }
 
 // TitleModelFlagArgs resolves the TitleModel key against the "model"
@@ -287,6 +330,8 @@ func providerSpecFromWorker(spec workerbuiltin.BuiltinProviderSpec) ProviderSpec
 		DisplayName:            spec.DisplayName,
 		Command:                spec.Command,
 		Args:                   cloneStrings(spec.Args),
+		ACPCommand:             spec.ACPCommand,
+		ACPArgs:                cloneStrings(spec.ACPArgs),
 		PromptMode:             spec.PromptMode,
 		PromptFlag:             spec.PromptFlag,
 		ReadyDelayMs:           spec.ReadyDelayMs,

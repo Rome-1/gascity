@@ -147,7 +147,12 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 
 	// Step 5: Build copy_files and command with settings args + schema defaults.
 	var copyFiles []runtime.CopyEntry
-	command := resolved.CommandString()
+	// Pick the ACP-mode command line when session="acp" and the provider
+	// declares a distinct ACP entrypoint (e.g. OpenCode's `opencode acp`).
+	// Providers without ACPCommand/ACPArgs get the tmux command line
+	// unchanged, preserving Claude Code's auto-detect behavior.
+	isACP := cfgAgent.Session == "acp"
+	command := resolved.CommandStringForTransport(isACP)
 	// Append schema-derived default args (e.g., --dangerously-skip-permissions
 	// from EffectiveDefaults["permission_mode"] = "unrestricted").
 	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
@@ -502,7 +507,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		RigName:          rigName,
 		RigRoot:          rigRoot,
 		WakeMode:         cfgAgent.WakeMode,
-		IsACP:            cfgAgent.Session == "acp",
+		IsACP:            isACP,
 		HookEnabled:      hasHooks,
 	}, nil
 }

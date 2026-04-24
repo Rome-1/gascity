@@ -209,6 +209,49 @@ func TestResolveProviderAutoDetect(t *testing.T) {
 	}
 }
 
+// TestResolveProviderOpenCodeACPFields verifies that the builtin
+// OpenCode profile's ACPCommand/ACPArgs survive resolution, so ACP
+// sessions launch `opencode acp` while tmux sessions stay on plain
+// `opencode`.
+func TestResolveProviderOpenCodeACPFields(t *testing.T) {
+	agent := &Agent{Name: "worker", Provider: "opencode"}
+	rp, err := ResolveProvider(agent, nil, nil, lookPathAll)
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if got := rp.CommandStringForTransport(false); got != "opencode" {
+		t.Errorf("tmux command = %q, want %q", got, "opencode")
+	}
+	if got := rp.CommandStringForTransport(true); got != "opencode acp" {
+		t.Errorf("acp command = %q, want %q", got, "opencode acp")
+	}
+}
+
+// TestResolveProviderACPOverrideFromCity verifies that a city.toml
+// [providers.X] block can set acp_command / acp_args and have them
+// flow through MergeProviderOverBuiltin and specToResolved.
+func TestResolveProviderACPOverrideFromCity(t *testing.T) {
+	agent := &Agent{Name: "worker", Provider: "my-opencode"}
+	cityProviders := map[string]ProviderSpec{
+		"my-opencode": {
+			Base:       basePtr("builtin:opencode"),
+			Command:    "wrap-opencode",
+			ACPCommand: "wrap-opencode",
+			ACPArgs:    []string{"serve", "--acp"},
+		},
+	}
+	rp, err := ResolveProvider(agent, nil, cityProviders, lookPathAll)
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if got := rp.CommandStringForTransport(true); got != "wrap-opencode serve --acp" {
+		t.Errorf("acp command = %q, want %q", got, "wrap-opencode serve --acp")
+	}
+	if got := rp.CommandStringForTransport(false); got != "wrap-opencode" {
+		t.Errorf("tmux command = %q, want %q", got, "wrap-opencode")
+	}
+}
+
 func TestResolveProviderAutoDetectNone(t *testing.T) {
 	agent := &Agent{Name: "worker"}
 	_, err := ResolveProvider(agent, nil, nil, lookPathNone)
@@ -1219,6 +1262,8 @@ func TestMergeProviderOverBuiltinFieldSync(t *testing.T) {
 		DisplayName:            "Custom",
 		Command:                "custom-cmd",
 		Args:                   []string{"--flag"},
+		ACPCommand:             "custom-acp",
+		ACPArgs:                []string{"acp"},
 		PromptMode:             "flag",
 		PromptFlag:             "--prompt",
 		ReadyDelayMs:           5000,

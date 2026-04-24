@@ -257,6 +257,76 @@ func TestCommandStringMultipleArgs(t *testing.T) {
 	}
 }
 
+func TestCommandStringForTransport(t *testing.T) {
+	tests := []struct {
+		name  string
+		rp    ResolvedProvider
+		isACP bool
+		want  string
+	}{
+		{
+			name:  "tmux_no_acp_override_uses_command",
+			rp:    ResolvedProvider{Command: "claude"},
+			isACP: false,
+			want:  "claude",
+		},
+		{
+			name:  "acp_no_override_uses_command",
+			rp:    ResolvedProvider{Command: "claude"},
+			isACP: true,
+			want:  "claude",
+		},
+		{
+			name: "acp_with_distinct_subcommand",
+			rp: ResolvedProvider{
+				Command:    "opencode",
+				ACPCommand: "opencode",
+				ACPArgs:    []string{"acp"},
+			},
+			isACP: true,
+			want:  "opencode acp",
+		},
+		{
+			name: "tmux_ignores_acp_fields",
+			rp: ResolvedProvider{
+				Command:    "opencode",
+				ACPCommand: "opencode",
+				ACPArgs:    []string{"acp"},
+			},
+			isACP: false,
+			want:  "opencode",
+		},
+		{
+			name: "acp_inherits_args_when_acpargs_nil",
+			rp: ResolvedProvider{
+				Command:    "tool",
+				Args:       []string{"--shared"},
+				ACPCommand: "tool-acp",
+				// ACPArgs: nil → reuse Args
+			},
+			isACP: true,
+			want:  "tool-acp --shared",
+		},
+		{
+			name: "acp_empty_slice_clears_args",
+			rp: ResolvedProvider{
+				Command: "tool",
+				Args:    []string{"--shared"},
+				ACPArgs: []string{}, // explicit empty, not nil
+			},
+			isACP: true,
+			want:  "tool",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.rp.CommandStringForTransport(tc.isACP); got != tc.want {
+				t.Errorf("CommandStringForTransport(%v) = %q, want %q", tc.isACP, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCommandStringQuotesShellMetacharacters(t *testing.T) {
 	rp := &ResolvedProvider{
 		Command: "codex",

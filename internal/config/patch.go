@@ -182,6 +182,12 @@ type ProviderPatch struct {
 	Command *string `toml:"command,omitempty"`
 	// Args overrides the provider args.
 	Args []string `toml:"args,omitempty"`
+	// ACPCommand overrides the provider's ACP-mode command.
+	ACPCommand *string `toml:"acp_command,omitempty"`
+	// ACPArgs overrides the provider's ACP-mode args. An explicit empty
+	// list is not representable through a patch — use a city-level
+	// [providers.X] block if you need to clear ACPArgs.
+	ACPArgs []string `toml:"acp_args,omitempty"`
 	// ArgsAppend overrides the provider args_append list.
 	ArgsAppend []string `toml:"args_append,omitempty"`
 	// OptionsSchemaMerge overrides the options_schema merge mode.
@@ -455,6 +461,13 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 			newSpec.Args = make([]string, len(patch.Args))
 			copy(newSpec.Args, patch.Args)
 		}
+		if patch.ACPCommand != nil {
+			newSpec.ACPCommand = *patch.ACPCommand
+		}
+		if len(patch.ACPArgs) > 0 {
+			newSpec.ACPArgs = make([]string, len(patch.ACPArgs))
+			copy(newSpec.ACPArgs, patch.ACPArgs)
+		}
 		if len(patch.ArgsAppend) > 0 {
 			newSpec.ArgsAppend = make([]string, len(patch.ArgsAppend))
 			copy(newSpec.ArgsAppend, patch.ArgsAppend)
@@ -490,6 +503,13 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 	if len(patch.Args) > 0 {
 		spec.Args = make([]string, len(patch.Args))
 		copy(spec.Args, patch.Args)
+	}
+	if patch.ACPCommand != nil {
+		spec.ACPCommand = *patch.ACPCommand
+	}
+	if len(patch.ACPArgs) > 0 {
+		spec.ACPArgs = make([]string, len(patch.ACPArgs))
+		copy(spec.ACPArgs, patch.ACPArgs)
 	}
 	if len(patch.ArgsAppend) > 0 {
 		spec.ArgsAppend = make([]string, len(patch.ArgsAppend))
