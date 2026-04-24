@@ -65,9 +65,18 @@ type ServerInfo struct {
 }
 
 // InitializeParams is the params for the "initialize" request.
+//
+// ProtocolVersion is REQUIRED by the ACP spec — strict servers (e.g.
+// OpenCode) reject the handshake with "expected number, received
+// undefined" when it is omitted. Claude Code is lenient and masked the
+// non-compliance historically.
 type InitializeParams struct {
-	ClientInfo ClientInfo `json:"clientInfo"`
+	ProtocolVersion int        `json:"protocolVersion"`
+	ClientInfo      ClientInfo `json:"clientInfo"`
 }
+
+// acpProtocolVersion is the ACP protocol version this client implements.
+const acpProtocolVersion = 1
 
 // InitializeResult is the result of the "initialize" request.
 type InitializeResult struct {
@@ -123,7 +132,8 @@ func newNotification(method string) JSONRPCMessage {
 // newInitializeRequest creates an "initialize" request.
 func newInitializeRequest() (JSONRPCMessage, int64) {
 	return newRequest("initialize", InitializeParams{
-		ClientInfo: ClientInfo{Name: "gc", Version: "1.0"},
+		ProtocolVersion: acpProtocolVersion,
+		ClientInfo:      ClientInfo{Name: "gc", Version: "1.0"},
 	})
 }
 

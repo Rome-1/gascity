@@ -39,6 +39,24 @@ func TestJSONRPCMessage_RequestRoundTrip(t *testing.T) {
 	if params.ClientInfo.Name != "gc" {
 		t.Errorf("clientInfo.name = %q, want %q", params.ClientInfo.Name, "gc")
 	}
+	if params.ProtocolVersion != acpProtocolVersion {
+		t.Errorf("protocolVersion = %d, want %d", params.ProtocolVersion, acpProtocolVersion)
+	}
+
+	// Strict ACP servers (e.g. OpenCode) require protocolVersion on the
+	// wire as a number. Ensure it is present in the marshaled JSON,
+	// not only decodable into the struct.
+	var raw map[string]any
+	if err := json.Unmarshal(decoded.Params, &raw); err != nil {
+		t.Fatalf("Unmarshal raw params: %v", err)
+	}
+	pv, ok := raw["protocolVersion"]
+	if !ok {
+		t.Fatalf("protocolVersion missing from initialize params; strict ACP servers reject this")
+	}
+	if n, ok := pv.(float64); !ok || int(n) != acpProtocolVersion {
+		t.Errorf("protocolVersion wire value = %v, want number %d", pv, acpProtocolVersion)
+	}
 }
 
 func TestJSONRPCMessage_NotificationOmitsID(t *testing.T) {
