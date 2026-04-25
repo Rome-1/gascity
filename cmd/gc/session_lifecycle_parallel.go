@@ -344,6 +344,9 @@ func buildPreparedStart(
 		firstStart := session.Metadata["started_config_hash"] == ""
 		forceFresh := session.Metadata["wake_mode"] == "fresh"
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, tp.ResolvedProvider, firstStart, forceFresh)
+		if !firstStart && !forceFresh && tp.ResolvedProvider.ResumeFlag == "" && tp.ResolvedProvider.ResumeCommand == "" {
+			log.Printf("session %s: provider %q has no resume mechanism (ResumeFlag and ResumeCommand both empty); launching a fresh process — prior in-memory session will be lost", session.ID, tp.ResolvedProvider.Name)
+		}
 	}
 	firstStart := session.Metadata["started_config_hash"] == ""
 	forceFresh := session.Metadata["wake_mode"] == "fresh"

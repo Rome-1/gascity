@@ -160,6 +160,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		InstructionsFile:  "AGENTS.md",
 		ResumeFlag:        "resume",
 		ResumeStyle:       "subcommand",
+		SessionIDFlag:     "--session-id",
 		PrintArgs:         []string{"exec"},
 		TitleModel:        "o4-mini",
 		PermissionModes: map[string]string{

@@ -29,6 +29,17 @@ func TestBuiltinProvidersAndOrder(t *testing.T) {
 	}
 }
 
+func TestCodexSessionIDFlag(t *testing.T) {
+	providers := BuiltinProviders()
+	codex, ok := providers["codex"]
+	if !ok {
+		t.Fatal("BuiltinProviders() missing codex")
+	}
+	if codex.SessionIDFlag != "--session-id" {
+		t.Errorf("codex.SessionIDFlag = %q, want %q (Generate-and-Pass strategy needs session-id assignment)", codex.SessionIDFlag, "--session-id")
+	}
+}
+
 func TestBuiltinProvidersReturnClonedData(t *testing.T) {
 	a := BuiltinProviders()
 	b := BuiltinProviders()
