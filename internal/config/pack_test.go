@@ -4126,3 +4126,45 @@ depends_on = ["db"]
 		t.Errorf("ValidateAgents failed after pack expansion: %v", err)
 	}
 }
+
+// TestDeepCopyProviderSpecACPArgs guards the nil-vs-empty distinction on
+// ACPArgs through deepCopyProviderSpec. Nil means "reuse Args at resolve
+// time"; an explicit empty slice means "no args in ACP mode" — they are
+// not interchangeable, so the copy must preserve which one the caller had.
+func TestDeepCopyProviderSpecACPArgs(t *testing.T) {
+	t.Run("nil_stays_nil", func(t *testing.T) {
+		in := ProviderSpec{Command: "p", ACPArgs: nil}
+		out := deepCopyProviderSpec(in)
+		if out.ACPArgs != nil {
+			t.Errorf("ACPArgs = %v, want nil", out.ACPArgs)
+		}
+	})
+	t.Run("empty_stays_empty_not_nil", func(t *testing.T) {
+		in := ProviderSpec{Command: "p", ACPArgs: []string{}}
+		out := deepCopyProviderSpec(in)
+		if out.ACPArgs == nil {
+			t.Error("ACPArgs = nil, want empty non-nil")
+		}
+		if len(out.ACPArgs) != 0 {
+			t.Errorf("len(ACPArgs) = %d, want 0", len(out.ACPArgs))
+		}
+	})
+	t.Run("populated_is_independent_copy", func(t *testing.T) {
+		in := ProviderSpec{Command: "p", ACPArgs: []string{"acp", "--flag"}}
+		out := deepCopyProviderSpec(in)
+		if len(out.ACPArgs) != 2 || out.ACPArgs[0] != "acp" || out.ACPArgs[1] != "--flag" {
+			t.Fatalf("ACPArgs = %v, want [acp --flag]", out.ACPArgs)
+		}
+		out.ACPArgs[0] = "mutated"
+		if in.ACPArgs[0] != "acp" {
+			t.Error("mutating copy changed source — not a deep copy")
+		}
+	})
+	t.Run("acp_command_copied", func(t *testing.T) {
+		in := ProviderSpec{Command: "p", ACPCommand: "p-acp"}
+		out := deepCopyProviderSpec(in)
+		if out.ACPCommand != "p-acp" {
+			t.Errorf("ACPCommand = %q, want %q", out.ACPCommand, "p-acp")
+		}
+	})
+}

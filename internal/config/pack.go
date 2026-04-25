@@ -1552,10 +1552,13 @@ func deepCopyProviderSpecs(in map[string]ProviderSpec) map[string]ProviderSpec {
 func deepCopyProviderSpec(in ProviderSpec) ProviderSpec {
 	out := in
 	out.Args = append([]string(nil), in.Args...)
-	// ACPArgs preserves nil-vs-empty: nil means "reuse Args" and must
-	// survive the copy, so don't widen a nil slice to an empty one.
+	// ACPArgs preserves nil-vs-empty: nil means "reuse Args" and an
+	// explicit empty slice means "no args in ACP mode" — they are not
+	// interchangeable. `append([]string(nil), empty...)` collapses empty
+	// to nil, so use make+copy to keep the empty case empty.
 	if in.ACPArgs != nil {
-		out.ACPArgs = append([]string(nil), in.ACPArgs...)
+		out.ACPArgs = make([]string, len(in.ACPArgs))
+		copy(out.ACPArgs, in.ACPArgs)
 	}
 	out.ArgsAppend = append([]string(nil), in.ArgsAppend...)
 	out.ProcessNames = append([]string(nil), in.ProcessNames...)

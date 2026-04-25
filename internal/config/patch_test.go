@@ -328,6 +328,124 @@ func TestApplyPatches_ProviderReplace(t *testing.T) {
 	}
 }
 
+// TestApplyPatches_ProviderDeepMergeACPFields verifies that ACPCommand /
+// ACPArgs flow through the deep-merge branch of applyProviderPatch. The
+// merge must (a) only replace ACPCommand when patch sets it, (b) replace
+// ACPArgs only when the patch list is non-empty, and (c) leave the
+// source patch slice unaliased — the spec must own its own ACPArgs copy.
+func TestApplyPatches_ProviderDeepMergeACPFields(t *testing.T) {
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"opencode": {
+				Command:    "opencode",
+				ACPCommand: "old-acp",
+				ACPArgs:    []string{"old"},
+			},
+		},
+	}
+	patchArgs := []string{"acp", "--strict"}
+	err := ApplyPatches(cfg, Patches{
+		Providers: []ProviderPatch{
+			{
+				Name:       "opencode",
+				ACPCommand: ptrStr("opencode"),
+				ACPArgs:    patchArgs,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	p := cfg.Providers["opencode"]
+	if p.ACPCommand != "opencode" {
+		t.Errorf("ACPCommand = %q, want %q", p.ACPCommand, "opencode")
+	}
+	if len(p.ACPArgs) != 2 || p.ACPArgs[0] != "acp" || p.ACPArgs[1] != "--strict" {
+		t.Errorf("ACPArgs = %v, want [acp --strict]", p.ACPArgs)
+	}
+	patchArgs[0] = "mutated"
+	if cfg.Providers["opencode"].ACPArgs[0] != "acp" {
+		t.Error("patch slice aliased into spec; deep-merge did not copy ACPArgs")
+	}
+}
+
+// TestApplyPatches_ProviderDeepMergeACPUnset verifies that omitting
+// ACPCommand and ACPArgs from a patch leaves existing values untouched.
+func TestApplyPatches_ProviderDeepMergeACPUnset(t *testing.T) {
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"opencode": {
+				Command:    "opencode",
+				ACPCommand: "opencode",
+				ACPArgs:    []string{"acp"},
+			},
+		},
+	}
+	err := ApplyPatches(cfg, Patches{
+		Providers: []ProviderPatch{
+			{Name: "opencode", Command: ptrStr("opencode-v2")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	p := cfg.Providers["opencode"]
+	if p.Command != "opencode-v2" {
+		t.Errorf("Command = %q, want %q", p.Command, "opencode-v2")
+	}
+	if p.ACPCommand != "opencode" {
+		t.Errorf("ACPCommand = %q, want %q (unchanged)", p.ACPCommand, "opencode")
+	}
+	if len(p.ACPArgs) != 1 || p.ACPArgs[0] != "acp" {
+		t.Errorf("ACPArgs = %v, want [acp] (unchanged)", p.ACPArgs)
+	}
+}
+
+// TestApplyPatches_ProviderReplaceACPFields verifies the Replace branch
+// rebuilds the spec with patch ACP fields, dropping anything not in the
+// patch. Distinct from deep-merge because Replace ignores existing spec
+// state.
+func TestApplyPatches_ProviderReplaceACPFields(t *testing.T) {
+	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"opencode": {
+				Command:    "old-cmd",
+				ACPCommand: "old-acp",
+				ACPArgs:    []string{"old-acp-arg"},
+			},
+		},
+	}
+	patchArgs := []string{"acp"}
+	err := ApplyPatches(cfg, Patches{
+		Providers: []ProviderPatch{
+			{
+				Name:       "opencode",
+				Replace:    true,
+				Command:    ptrStr("opencode"),
+				ACPCommand: ptrStr("opencode"),
+				ACPArgs:    patchArgs,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	p := cfg.Providers["opencode"]
+	if p.Command != "opencode" {
+		t.Errorf("Command = %q, want %q", p.Command, "opencode")
+	}
+	if p.ACPCommand != "opencode" {
+		t.Errorf("ACPCommand = %q, want %q", p.ACPCommand, "opencode")
+	}
+	if len(p.ACPArgs) != 1 || p.ACPArgs[0] != "acp" {
+		t.Errorf("ACPArgs = %v, want [acp]", p.ACPArgs)
+	}
+	patchArgs[0] = "mutated"
+	if cfg.Providers["opencode"].ACPArgs[0] != "acp" {
+		t.Error("patch slice aliased into spec; Replace did not copy ACPArgs")
+	}
+}
+
 func TestApplyPatches_ProviderNotFound(t *testing.T) {
 	cfg := &City{
 		Providers: map[string]ProviderSpec{},
