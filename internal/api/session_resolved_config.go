@@ -25,7 +25,7 @@ func resolvedSessionConfigForProvider(
 		Transport:    transport,
 		Metadata:     metadata,
 		Runtime: worker.ResolvedRuntime{
-			Command:    firstNonEmptyString(command, resolved.CommandString(), resolved.Name),
+			Command:    firstNonEmptyString(command, resolved.CommandStringForTransport(transport == "acp"), resolved.Name),
 			WorkDir:    workDir,
 			Provider:   resolved.Name,
 			SessionEnv: resolved.Env,

@@ -82,3 +82,31 @@ func TestResolvedSessionConfigForProviderRejectsNilProvider(t *testing.T) {
 		t.Fatal("resolvedSessionConfigForProvider() error = nil, want error")
 	}
 }
+
+func TestResolvedSessionConfigForProviderUsesACPTransportCommandFallback(t *testing.T) {
+	resolved := &config.ResolvedProvider{
+		Name:       "opencode",
+		Command:    "opencode",
+		ACPCommand: "opencode",
+		ACPArgs:    []string{"acp"},
+	}
+
+	cfg, err := resolvedSessionConfigForProvider(
+		"worker",
+		"",
+		"myrig/worker",
+		"Worker",
+		"acp",
+		nil,
+		resolved,
+		"",
+		"/tmp/workdir",
+	)
+	if err != nil {
+		t.Fatalf("resolvedSessionConfigForProvider: %v", err)
+	}
+
+	if got, want := cfg.Runtime.Command, "opencode acp"; got != want {
+		t.Fatalf("Runtime.Command = %q, want %q", got, want)
+	}
+}

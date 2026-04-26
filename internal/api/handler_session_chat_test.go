@@ -170,3 +170,77 @@ func TestBuildSessionResumeRebuildsBareStoredCommandForPoolClaudeAgent(t *testin
 		t.Fatalf("resume command missing settings arg:\n  got: %s", cmd)
 	}
 }
+
+func TestBuildSessionResumeUsesACPTransportCommandWhenStoredCommandIsStale(t *testing.T) {
+	fs := newSessionFakeState(t)
+	fs.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "reviewer", Provider: "opencode", Session: "acp"},
+		},
+		Providers: map[string]config.ProviderSpec{
+			"opencode": {
+				DisplayName: "OpenCode",
+				Command:     "opencode",
+				ACPCommand:  "opencode",
+				ACPArgs:     []string{"acp"},
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+				PathCheck:   "true",
+			},
+		},
+	}
+
+	srv := New(fs)
+	info := session.Info{
+		ID:          "gc-2",
+		Template:    "reviewer",
+		Command:     "opencode",
+		Provider:    "opencode",
+		WorkDir:     "/tmp/workdir",
+		SessionKey:  "sess-key",
+		ResumeFlag:  "--resume",
+		ResumeStyle: "flag",
+	}
+
+	cmd, _ := srv.buildSessionResume(info)
+	if got, want := cmd, "opencode acp --resume sess-key"; got != want {
+		t.Fatalf("resume command = %q, want %q", got, want)
+	}
+}
+
+func TestBuildSessionResumeUsesACPTransportForProviderSessions(t *testing.T) {
+	fs := newSessionFakeState(t)
+	fs.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Providers: map[string]config.ProviderSpec{
+			"opencode": {
+				DisplayName: "OpenCode",
+				Command:     "opencode",
+				ACPCommand:  "opencode",
+				ACPArgs:     []string{"acp"},
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+				PathCheck:   "true",
+			},
+		},
+	}
+
+	srv := New(fs)
+	info := session.Info{
+		ID:          "gc-provider",
+		Template:    "opencode",
+		Provider:    "opencode",
+		Transport:   "acp",
+		Command:     "opencode",
+		WorkDir:     "/tmp/workdir",
+		SessionKey:  "sess-key",
+		ResumeFlag:  "--resume",
+		ResumeStyle: "flag",
+	}
+
+	cmd, _ := srv.buildSessionResume(info)
+	if got, want := cmd, "opencode acp --resume sess-key"; got != want {
+		t.Fatalf("resume command = %q, want %q", got, want)
+	}
+}

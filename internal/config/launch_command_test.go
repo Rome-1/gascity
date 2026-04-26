@@ -75,3 +75,21 @@ func TestBuildProviderLaunchCommandIgnoresInitialMessageOverride(t *testing.T) {
 		t.Fatalf("Command = %q, want %q", got.Command, want)
 	}
 }
+
+func TestBuildProviderLaunchCommandForTransportUsesACPCommand(t *testing.T) {
+	rp := &ResolvedProvider{
+		Name:       "opencode",
+		Command:    "opencode",
+		ACPCommand: "opencode",
+		ACPArgs:    []string{"acp"},
+	}
+
+	got, err := BuildProviderLaunchCommandForTransport("", rp, nil, "acp")
+	if err != nil {
+		t.Fatalf("BuildProviderLaunchCommandForTransport: %v", err)
+	}
+
+	if got.Command != "opencode acp" {
+		t.Fatalf("Command = %q, want %q", got.Command, "opencode acp")
+	}
+}

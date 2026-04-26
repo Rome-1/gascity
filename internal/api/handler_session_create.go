@@ -127,7 +127,7 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	command := sessionCreateAgentCommand(resolved)
+	command := sessionCreateAgentCommand(resolved, transport)
 
 	// Build template_overrides metadata. Includes schema overrides AND
 	// the initial message (as "initial_message" key). The reconciler
@@ -359,8 +359,8 @@ func (s *Server) createProviderSession(w http.ResponseWriter, r *http.Request, s
 	writeJSON(w, statusCode, resp)
 }
 
-func sessionCreateAgentCommand(resolved *config.ResolvedProvider) string {
-	return firstNonEmptyString(resolved.CommandString(), resolved.Name)
+func sessionCreateAgentCommand(resolved *config.ResolvedProvider, transport string) string {
+	return firstNonEmptyString(resolved.CommandStringForTransport(transport == "acp"), resolved.Name)
 }
 
 func sessionTemplateOverridesMetadata(options map[string]string, message string) map[string]string {

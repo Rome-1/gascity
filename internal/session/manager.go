@@ -65,6 +65,7 @@ type Info struct {
 	Title         string
 	Alias         string
 	Provider      string
+	Transport     string
 	Command       string // resolved command stored at creation
 	WorkDir       string
 	SessionName   string // tmux session name
@@ -1138,8 +1139,11 @@ func (m *Manager) infoFromBead(b beads.Bead) Info {
 		sessName = sessionNameFor(b.ID)
 	}
 	closed := b.Status == "closed"
+	transport := transportFromMetadata(b)
 	if !closed {
-		transport, _ := m.transportForBead(b, sessName)
+		if transport == "" {
+			transport, _ = m.transportForBead(b, sessName)
+		}
 		_ = m.routeACPIfNeeded(b.Metadata["provider"], transport, sessName)
 	}
 
@@ -1160,6 +1164,7 @@ func (m *Manager) infoFromBead(b beads.Bead) Info {
 		Title:         b.Title,
 		Alias:         b.Metadata["alias"],
 		Provider:      b.Metadata["provider"],
+		Transport:     transport,
 		Command:       b.Metadata["command"],
 		WorkDir:       b.Metadata["work_dir"],
 		SessionName:   sessName,

@@ -515,6 +515,32 @@ func TestResolvedWorkerSessionConfigWithConfigFallsBackToProviderArgForCommand(t
 	}
 }
 
+func TestResolvedWorkerSessionConfigWithConfigUsesACPTransportCommandFallback(t *testing.T) {
+	cfg, err := resolvedWorkerSessionConfigWithConfig(
+		"",
+		"",
+		"/tmp/work",
+		"worker",
+		"",
+		"worker",
+		"Worker",
+		"acp",
+		&config.ResolvedProvider{
+			Name:       "opencode",
+			Command:    "opencode",
+			ACPCommand: "opencode",
+			ACPArgs:    []string{"acp"},
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("resolvedWorkerSessionConfigWithConfig: %v", err)
+	}
+	if got, want := cfg.Runtime.Command, "opencode acp"; got != want {
+		t.Fatalf("Runtime.Command = %q, want %q", got, want)
+	}
+}
+
 func TestResolvedWorkerRuntimeWithConfigFallsBackToCityPathAndSyncsHintsWorkDir(t *testing.T) {
 	cityDir := t.TempDir()
 	writePhase0InterfaceCity(t, cityDir, `[workspace]
@@ -554,6 +580,41 @@ ready_delay_ms = 250
 		t.Fatalf("Provider = %q, want %q", got, want)
 	}
 	if got, want := runtimeCfg.Command, "/bin/echo"; got != want {
+		t.Fatalf("Command = %q, want %q", got, want)
+	}
+}
+
+func TestResolvedWorkerRuntimeWithConfigUsesInfoTransportForProviderSessions(t *testing.T) {
+	cityDir := t.TempDir()
+	writePhase0InterfaceCity(t, cityDir, `[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[providers.opencode]
+command = "opencode"
+acp_command = "opencode"
+acp_args = ["acp"]
+path_check = "true"
+`)
+
+	cfg, err := loadCityConfig(cityDir)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+
+	runtimeCfg := resolvedWorkerRuntimeWithConfig(cityDir, cfg, session.Info{
+		Template:  "opencode",
+		Provider:  "opencode",
+		Transport: "acp",
+		Command:   "opencode",
+		WorkDir:   t.TempDir(),
+	}, "provider")
+	if runtimeCfg == nil {
+		t.Fatal("resolvedWorkerRuntimeWithConfig() = nil")
+	}
+	if got, want := runtimeCfg.Command, "opencode acp"; got != want {
 		t.Fatalf("Command = %q, want %q", got, want)
 	}
 }

@@ -605,6 +605,108 @@ func TestBuildResumeCommandUsesResolvedProviderCommand(t *testing.T) {
 	}
 }
 
+func TestBuildResumeCommandUsesACPTransportCommand(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "reviewer", Provider: "opencode", Session: "acp"},
+		},
+		Providers: map[string]config.ProviderSpec{
+			"opencode": {
+				DisplayName: "OpenCode",
+				Command:     "opencode",
+				ACPCommand:  "opencode",
+				ACPArgs:     []string{"acp"},
+				PathCheck:   "true",
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+			},
+		},
+	}
+
+	info := session.Info{
+		Template:   "reviewer",
+		Command:    "opencode",
+		Provider:   "opencode",
+		WorkDir:    "/tmp/workdir",
+		SessionKey: "sess-key",
+	}
+
+	cmd, _ := buildResumeCommand(t.TempDir(), cfg, info, "", io.Discard)
+	if got, want := cmd, "opencode acp --resume sess-key"; got != want {
+		t.Fatalf("resume command = %q, want %q", got, want)
+	}
+}
+
+func TestBuildResumeCommandSkipsAgentResolutionForProviderSessions(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "shell", Provider: "wrapped"},
+		},
+		Providers: map[string]config.ProviderSpec{
+			"wrapped": {
+				DisplayName: "Wrapped Shell",
+				Command:     "wrapped-cli",
+				PathCheck:   "true",
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+			},
+			"shell": {
+				DisplayName: "Shell Provider",
+				Command:     "provider-cli",
+				PathCheck:   "true",
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+			},
+		},
+	}
+
+	info := session.Info{
+		Template:   "shell",
+		Command:    "provider-cli",
+		Provider:   "shell",
+		WorkDir:    "/tmp/workdir",
+		SessionKey: "sess-key",
+	}
+
+	cmd, _ := buildResumeCommand(t.TempDir(), cfg, info, "provider", io.Discard)
+	if got, want := cmd, "provider-cli --resume sess-key"; got != want {
+		t.Fatalf("resume command = %q, want %q", got, want)
+	}
+}
+
+func TestBuildResumeCommandUsesACPTransportForProviderSessions(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Providers: map[string]config.ProviderSpec{
+			"opencode": {
+				DisplayName: "OpenCode",
+				Command:     "opencode",
+				ACPCommand:  "opencode",
+				ACPArgs:     []string{"acp"},
+				PathCheck:   "true",
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+			},
+		},
+	}
+
+	info := session.Info{
+		Template:   "opencode",
+		Provider:   "opencode",
+		Transport:  "acp",
+		Command:    "opencode",
+		WorkDir:    "/tmp/workdir",
+		SessionKey: "sess-key",
+	}
+
+	cmd, _ := buildResumeCommand(t.TempDir(), cfg, info, "provider", io.Discard)
+	if got, want := cmd, "opencode acp --resume sess-key"; got != want {
+		t.Fatalf("resume command = %q, want %q", got, want)
+	}
+}
+
 func TestBuildResumeCommandIncludesSettingsAndDefaultArgs(t *testing.T) {
 	cityDir := t.TempDir()
 	// Write a .gc/settings.json so settingsArgs finds it.
@@ -1297,7 +1399,7 @@ func TestResolvedSessionCommandIncludesDefaultsAndSettings(t *testing.T) {
 		EffectiveDefaults: config.ComputeEffectiveDefaults(claude.OptionsSchema, claude.OptionDefaults, nil),
 	}
 
-	got, err := resolvedSessionCommand(cityPath, resolved, nil)
+	got, err := resolvedSessionCommand(cityPath, resolved, nil, "")
 	if err != nil {
 		t.Fatalf("resolvedSessionCommand: %v", err)
 	}
@@ -1326,7 +1428,7 @@ func TestResolvedSessionCommandAppliesOverridesOverDefaults(t *testing.T) {
 	got, err := resolvedSessionCommand(cityPath, resolved, map[string]string{
 		"permission_mode": "plan",
 		"effort":          "low",
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("resolvedSessionCommand: %v", err)
 	}
@@ -1338,5 +1440,22 @@ func TestResolvedSessionCommandAppliesOverridesOverDefaults(t *testing.T) {
 	}
 	if !strings.Contains(got, "--effort low") {
 		t.Fatalf("command %q should include effort=low override", got)
+	}
+}
+
+func TestResolvedSessionCommandUsesACPTransportCommand(t *testing.T) {
+	resolved := &config.ResolvedProvider{
+		Name:       "opencode",
+		Command:    "opencode",
+		ACPCommand: "opencode",
+		ACPArgs:    []string{"acp"},
+	}
+
+	got, err := resolvedSessionCommand("", resolved, nil, "acp")
+	if err != nil {
+		t.Fatalf("resolvedSessionCommand: %v", err)
+	}
+	if got != "opencode acp" {
+		t.Fatalf("command = %q, want %q", got, "opencode acp")
 	}
 }

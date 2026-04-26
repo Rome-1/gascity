@@ -23,11 +23,17 @@ type ProviderLaunchCommand struct {
 // schema-managed defaults plus any explicit option overrides, and appends a
 // provider-owned settings file when present.
 func BuildProviderLaunchCommand(cityPath string, resolved *ResolvedProvider, optionOverrides map[string]string) (ProviderLaunchCommand, error) {
+	return BuildProviderLaunchCommandForTransport(cityPath, resolved, optionOverrides, "")
+}
+
+// BuildProviderLaunchCommandForTransport composes the final provider launch
+// command for a specific transport.
+func BuildProviderLaunchCommandForTransport(cityPath string, resolved *ResolvedProvider, optionOverrides map[string]string, transport string) (ProviderLaunchCommand, error) {
 	if resolved == nil {
 		return ProviderLaunchCommand{}, fmt.Errorf("resolved provider is nil")
 	}
 
-	command := resolved.CommandString()
+	command := resolved.CommandStringForTransport(strings.TrimSpace(transport) == "acp")
 	if len(resolved.OptionsSchema) > 0 {
 		mergedOptions := make(map[string]string, len(resolved.EffectiveDefaults)+len(optionOverrides))
 		for key, value := range resolved.EffectiveDefaults {

@@ -113,15 +113,15 @@ func (s *Server) resolveSessionTemplate(template string) (*config.ResolvedProvid
 
 func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config) {
 	cmd := session.BuildResumeCommand(info)
-	resolved, workDir := s.resolveSessionRuntime(info)
+	resolved, workDir, transport := s.resolveSessionRuntime(info)
 	if resolved == nil {
 		return cmd, runtime.Config{WorkDir: info.WorkDir}
 	}
 	resolvedInfo := info
-	if command, err := s.resolvedSessionRuntimeCommand(resolved, info.Command); err == nil {
+	if command, err := s.resolvedSessionRuntimeCommand(resolved, info.Command, transport); err == nil {
 		resolvedInfo.Command = command
 	} else {
-		resolvedInfo.Command = firstNonEmptyString(info.Command, resolved.CommandString(), resolved.Name)
+		resolvedInfo.Command = firstNonEmptyString(info.Command, resolved.CommandStringForTransport(transport == "acp"), resolved.Name)
 	}
 	resolvedInfo.Provider = resolved.Name
 	resolvedInfo.ResumeFlag = resolved.ResumeFlag
@@ -130,15 +130,16 @@ func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config) 
 	return session.BuildResumeCommand(resolvedInfo), sessionResumeHints(resolved, workDir)
 }
 
-func (s *Server) resolvedSessionRuntimeCommand(resolved *config.ResolvedProvider, storedCommand string) (string, error) {
-	if command := strings.TrimSpace(storedCommand); shouldPreserveStoredRuntimeCommand(command, resolved.CommandString()) {
+func (s *Server) resolvedSessionRuntimeCommand(resolved *config.ResolvedProvider, storedCommand string, transport string) (string, error) {
+	resolvedCommand := resolved.CommandStringForTransport(transport == "acp")
+	if command := strings.TrimSpace(storedCommand); shouldPreserveStoredRuntimeCommand(command, resolvedCommand) {
 		return command, nil
 	}
-	launchCommand, err := config.BuildProviderLaunchCommand(s.state.CityPath(), resolved, nil)
+	launchCommand, err := config.BuildProviderLaunchCommandForTransport(s.state.CityPath(), resolved, nil, transport)
 	if err != nil {
 		return "", fmt.Errorf("building provider launch command: %w", err)
 	}
-	return firstNonEmptyString(launchCommand.Command, resolved.CommandString(), resolved.Name), nil
+	return firstNonEmptyString(launchCommand.Command, resolvedCommand, resolved.Name), nil
 }
 
 func shouldPreserveStoredRuntimeCommand(storedCommand, resolvedCommand string) bool {
@@ -163,11 +164,11 @@ func shouldPreserveStoredRuntimeCommand(storedCommand, resolvedCommand string) b
 }
 
 func (s *Server) resolveWorkerSessionRuntime(info session.Info, _ string) (*worker.ResolvedRuntime, error) {
-	resolved, workDir := s.resolveSessionRuntime(info)
+	resolved, workDir, transport := s.resolveSessionRuntime(info)
 	if resolved == nil {
 		return nil, nil
 	}
-	command, err := s.resolvedSessionRuntimeCommand(resolved, info.Command)
+	command, err := s.resolvedSessionRuntimeCommand(resolved, info.Command, transport)
 	if err != nil {
 		return nil, err
 	}
@@ -190,27 +191,30 @@ func (s *Server) resolveWorkerSessionRuntime(info session.Info, _ string) (*work
 	return &runtimeCfg, nil
 }
 
-func (s *Server) resolveSessionRuntime(info session.Info) (*config.ResolvedProvider, string) {
+func (s *Server) resolveSessionRuntime(info session.Info) (*config.ResolvedProvider, string, string) {
 	kind := s.sessionKind(info.ID)
 	if kind != "provider" {
-		resolved, workDir, _, _, err := s.resolveSessionTemplate(info.Template)
+		resolved, workDir, transport, _, err := s.resolveSessionTemplate(info.Template)
 		if err == nil {
 			if info.WorkDir != "" {
 				workDir = info.WorkDir
 			}
-			return resolved, workDir
+			if strings.TrimSpace(transport) == "" {
+				transport = strings.TrimSpace(info.Transport)
+			}
+			return resolved, workDir, transport
 		}
 	}
 
 	resolved, err := s.resolveBareProvider(info.Template)
 	if err != nil {
-		return nil, ""
+		return nil, "", ""
 	}
 	workDir := info.WorkDir
 	if workDir == "" {
 		workDir = s.state.CityPath()
 	}
-	return resolved, workDir
+	return resolved, workDir, strings.TrimSpace(info.Transport)
 }
 
 // sessionKind reads the persisted mc_session_kind from bead metadata.

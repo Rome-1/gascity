@@ -125,7 +125,7 @@ func resolvedWorkerSessionConfigWithConfig(
 	}
 	command = strings.TrimSpace(command)
 	if command == "" {
-		command = strings.TrimSpace(resolved.CommandString())
+		command = strings.TrimSpace(resolved.CommandStringForTransport(transport == "acp"))
 	}
 	providerName := strings.TrimSpace(resolved.Name)
 	if providerName == "" {
@@ -317,15 +317,16 @@ func resolvedWorkerRuntimeWithConfig(cityPath string, cfg *config.City, info ses
 	if cfg == nil {
 		return nil
 	}
-	resolved := resolveWorkerRuntimeWithConfig(cfg, info, sessionKind)
+	resolved, transport := resolveWorkerRuntimeWithConfig(cfg, info, sessionKind)
 	if resolved == nil {
 		return nil
 	}
 
 	command := strings.TrimSpace(info.Command)
-	if !shouldPreserveStoredRuntimeCommand(command, resolved.CommandString()) {
-		launchCommand, err := config.BuildProviderLaunchCommand(cityPath, resolved, nil)
-		command = resolved.CommandString()
+	resolvedCommand := resolved.CommandStringForTransport(transport == "acp")
+	if !shouldPreserveStoredRuntimeCommand(command, resolvedCommand) {
+		launchCommand, err := config.BuildProviderLaunchCommandForTransport(cityPath, resolved, nil, transport)
+		command = resolvedCommand
 		if err == nil {
 			command = launchCommand.Command
 		}
@@ -378,22 +379,26 @@ func shouldPreserveStoredRuntimeCommand(storedCommand, resolvedCommand string) b
 	return strings.HasPrefix(storedCommand, resolvedCommand+" ")
 }
 
-func resolveWorkerRuntimeWithConfig(cfg *config.City, info session.Info, sessionKind string) *config.ResolvedProvider {
+func resolveWorkerRuntimeWithConfig(cfg *config.City, info session.Info, sessionKind string) (*config.ResolvedProvider, string) {
 	if cfg == nil {
-		return nil
+		return nil, ""
 	}
 	if sessionKind != "provider" {
 		if found, ok := resolveAgentIdentity(cfg, info.Template, ""); ok {
 			if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
-				return resolved
+				transport := found.Session
+				if strings.TrimSpace(transport) == "" {
+					transport = strings.TrimSpace(info.Transport)
+				}
+				return resolved, transport
 			}
 		}
 	}
 	resolved, err := config.ResolveProvider(&config.Agent{Provider: info.Template}, &cfg.Workspace, cfg.Providers, exec.LookPath)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
-	return resolved
+	return resolved, strings.TrimSpace(info.Transport)
 }
 
 func workerDeliveryIntentForSubmitIntent(intent session.SubmitIntent) worker.DeliveryIntent {

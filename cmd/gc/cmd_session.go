@@ -223,7 +223,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 	if err != nil {
 		titleProvider = nil
 	}
-	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil)
+	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, found.Session)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -401,11 +401,11 @@ func maybeAutoTitle(store beads.Store, beadID, userTitle, titleHint string, prov
 	})
 }
 
-func resolvedSessionCommand(cityPath string, resolved *config.ResolvedProvider, optionOverrides map[string]string) (string, error) {
+func resolvedSessionCommand(cityPath string, resolved *config.ResolvedProvider, optionOverrides map[string]string, transport string) (string, error) {
 	if resolved == nil {
 		return "", fmt.Errorf("resolved provider is nil")
 	}
-	launchCommand, err := config.BuildProviderLaunchCommand(cityPath, resolved, optionOverrides)
+	launchCommand, err := config.BuildProviderLaunchCommandForTransport(cityPath, resolved, optionOverrides, transport)
 	if err != nil {
 		return "", fmt.Errorf("resolving provider launch command: %w", err)
 	}
@@ -922,21 +922,21 @@ func cmdSessionAttach(args []string, stdout, stderr io.Writer) int {
 // sessionKind mirrors the mc_session_kind bead metadata: "provider" means
 // the session was created from a bare provider name (not an agent template),
 // so the agent-template lookup should be skipped. This matches the guard in
-// the API handler (handler_session_chat.go).
+// the API runtime reconstruction path.
 func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, sessionKind string, stderr io.Writer) (string, runtime.Config) {
 	cmd := session.BuildResumeCommand(info)
 	if cfg == nil {
 		return cmd, runtime.Config{WorkDir: info.WorkDir}
 	}
 
-	buildResolved := func(resolved *config.ResolvedProvider) (string, runtime.Config) {
+	buildResolved := func(resolved *config.ResolvedProvider, transport string) (string, runtime.Config) {
 		if resolved == nil {
 			return cmd, runtime.Config{WorkDir: info.WorkDir}
 		}
 		resolvedInfo := info
 		// Build command with default args and settings, matching the
 		// reconciler's template_resolve.go command construction.
-		command := resolved.CommandString()
+		command := resolved.CommandStringForTransport(transport == "acp")
 		if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
 			command = command + " " + shellquote.Join(defaultArgs)
 		}
@@ -983,14 +983,18 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 		// stored command text so submit/restart paths honor provider overrides.
 		if found, ok := resolveAgentIdentity(cfg, info.Template, ""); ok {
 			if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
-				return buildResolved(resolved)
+				transport := found.Session
+				if strings.TrimSpace(transport) == "" {
+					transport = strings.TrimSpace(info.Transport)
+				}
+				return buildResolved(resolved, transport)
 			}
 		}
 	}
 
 	// Fallback for provider-only sessions whose Template is a provider name.
 	if resolved, err := config.ResolveProvider(&config.Agent{Provider: info.Template}, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
-		return buildResolved(resolved)
+		return buildResolved(resolved, strings.TrimSpace(info.Transport))
 	}
 
 	return cmd, runtime.Config{WorkDir: info.WorkDir}

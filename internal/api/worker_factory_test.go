@@ -135,6 +135,78 @@ func TestResolveWorkerSessionRuntimeUsesResolvedCommandWhenPersistedCommandIsSta
 	}
 }
 
+func TestResolveWorkerSessionRuntimeUsesACPTransportCommandWhenPersistedCommandIsStale(t *testing.T) {
+	fs := newSessionFakeState(t)
+	fs.cfg.Agents[0].Provider = "opencode"
+	fs.cfg.Agents[0].Session = "acp"
+	fs.cfg.Providers["opencode"] = config.ProviderSpec{
+		DisplayName:       "OpenCode",
+		Command:           "opencode",
+		ACPCommand:        "opencode",
+		ACPArgs:           []string{"acp"},
+		ReadyPromptPrefix: "resolved-ready>",
+		ReadyDelayMs:      321,
+		PathCheck:         "true",
+	}
+
+	srv := New(fs)
+	info := session.Info{
+		ID:       "sess-1",
+		Template: "myrig/worker",
+		Command:  "opencode",
+		Provider: "opencode",
+		WorkDir:  t.TempDir(),
+	}
+
+	runtimeCfg, err := srv.resolveWorkerSessionRuntime(info, "")
+	if err != nil {
+		t.Fatalf("resolveWorkerSessionRuntime: %v", err)
+	}
+	if runtimeCfg == nil {
+		t.Fatal("resolveWorkerSessionRuntime() = nil")
+	}
+	if got, want := runtimeCfg.Command, "opencode acp"; got != want {
+		t.Fatalf("Command = %q, want %q", got, want)
+	}
+}
+
+func TestResolveWorkerSessionRuntimeUsesInfoTransportForProviderSessions(t *testing.T) {
+	fs := newSessionFakeState(t)
+	fs.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Providers: map[string]config.ProviderSpec{
+			"opencode": {
+				DisplayName: "OpenCode",
+				Command:     "opencode",
+				ACPCommand:  "opencode",
+				ACPArgs:     []string{"acp"},
+				PathCheck:   "true",
+			},
+		},
+	}
+
+	srv := New(fs)
+	info := session.Info{
+		ID:        "provider-1",
+		Template:  "opencode",
+		Provider:  "opencode",
+		Transport: "acp",
+		Command:   "opencode",
+		WorkDir:   t.TempDir(),
+	}
+
+	runtimeCfg, err := srv.resolveWorkerSessionRuntime(info, "")
+	if err != nil {
+		t.Fatalf("resolveWorkerSessionRuntime: %v", err)
+	}
+	if runtimeCfg == nil {
+		t.Fatal("resolveWorkerSessionRuntime() = nil")
+	}
+	if got, want := runtimeCfg.Command, "opencode acp"; got != want {
+		t.Fatalf("Command = %q, want %q", got, want)
+	}
+}
+
 func TestWorkerFactorySessionByIDUsesResolvedTemplateRuntime(t *testing.T) {
 	fs := newSessionFakeState(t)
 	fs.cfg.Agents[0].Provider = "resolved-worker"
