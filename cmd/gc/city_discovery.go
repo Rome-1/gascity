@@ -27,19 +27,33 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 		return "", err
 	}
 
+	// Always check the starting directory itself — even if it sits at the
+	// discovery ceiling (e.g. cwd == $HOME). The ceiling exists to bound
+	// upward resolution to an unrelated ancestor; a city the user is
+	// standing directly inside should still be found.
+	if citylayout.HasCityConfig(dir) {
+		return dir, nil
+	}
 	var legacy string
-	for !isCityDiscoveryCeiling(dir, opts.ceilingDirs) {
+	if citylayout.HasRuntimeRoot(dir) && !isIgnoredLegacyRuntimeRoot(dir, opts.ignoredLegacyRuntime) {
+		legacy = dir
+	}
+
+	for {
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+		if isCityDiscoveryCeiling(dir, opts.ceilingDirs) {
+			break
+		}
 		if citylayout.HasCityConfig(dir) {
 			return dir, nil
 		}
 		if legacy == "" && citylayout.HasRuntimeRoot(dir) && !isIgnoredLegacyRuntimeRoot(dir, opts.ignoredLegacyRuntime) {
 			legacy = dir
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
 	}
 	if legacy != "" {
 		return legacy, nil

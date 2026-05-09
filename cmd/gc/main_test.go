@@ -468,6 +468,51 @@ func TestFindCity(t *testing.T) {
 		}
 	})
 
+	t.Run("city_at_home_is_found", func(t *testing.T) {
+		// Repro for the bug where a city installed directly at $HOME
+		// (e.g. running as user "gc" with city at /home/gc) was reported
+		// as "not in a city directory" because the discovery ceiling
+		// fired before the starting dir was checked. The ceiling should
+		// only bound upward traversal, not the dir the user is in.
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+
+		if err := os.WriteFile(filepath.Join(homeDir, "city.toml"), []byte("[workspace]\nname = \"home-city\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := findCity(homeDir)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", homeDir, err)
+		}
+		if got != homeDir {
+			t.Errorf("findCity(%q) = %q, want %q", homeDir, got, homeDir)
+		}
+	})
+
+	t.Run("city_at_explicit_ceiling_dir_is_found", func(t *testing.T) {
+		// Same idea as city_at_home, but for an explicit
+		// GC_CEILING_DIRECTORIES entry.
+		root := t.TempDir()
+		ceiling := filepath.Join(root, "ceiling")
+		if err := os.MkdirAll(ceiling, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(ceiling, "city.toml"), []byte("[workspace]\nname = \"ceiling-city\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GC_CEILING_DIRECTORIES", ceiling)
+
+		got, err := findCity(ceiling)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", ceiling, err)
+		}
+		if got != ceiling {
+			t.Errorf("findCity(%q) = %q, want %q", ceiling, got, ceiling)
+		}
+	})
+
 	t.Run("respects_gc_ceiling_directories", func(t *testing.T) {
 		root := t.TempDir()
 		parent := filepath.Join(root, "parent")
