@@ -611,6 +611,7 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	// Validate cross-entity semantic constraints.
 	prov.Warnings = append(prov.Warnings, ValidateSemantics(root, path)...)
 	prov.Warnings = append(prov.Warnings, DetectLegacyProviderInheritance(root, path)...)
+	prov.Warnings = append(prov.Warnings, DetectLegacyWorkspaceFields(root, path)...)
 
 	// Build the resolved provider cache now that compose + patch have
 	// populated the full provider table. Chain resolution errors
