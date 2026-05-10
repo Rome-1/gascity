@@ -121,6 +121,13 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	prov := newProvenance(path)
 	prov.recordSource(path, data)
 	prov.Warnings = append(prov.Warnings, rootWarnings...)
+	// Detect top-level v1 surfaces on the freshly-parsed city.toml,
+	// BEFORE pack.toml merging or fragment processing has a chance to
+	// inject pack-discovered agents / merge pack-default rig includes
+	// into these same fields. Running here is the only way to
+	// distinguish "user declared at city.toml level" from "discovered
+	// through pack composition".
+	prov.Warnings = append(prov.Warnings, DetectLegacyV1Surfaces(root, path)...)
 	cityAgentsForProvenance := root.Agents
 	root.Pricing = dedupePricingByKey(root.Pricing)
 	root.CityPricing = append([]pricing.ModelPricing(nil), root.Pricing...)
