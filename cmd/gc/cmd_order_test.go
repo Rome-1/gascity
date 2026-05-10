@@ -139,15 +139,19 @@ func TestCityOrderRootsUseTopLevelPackOrders(t *testing.T) {
 	t.Fatalf("cityOrderRoots() missing %q", ordersDir)
 }
 
-func TestCityOrderRootsDedupesLegacyLocalRoot(t *testing.T) {
+func TestCityOrderRootsDedupesLocalFormulasRoot(t *testing.T) {
+	// With [formulas].dir enforced as a fixed convention, the local
+	// formulas dir is always cityDir/formulas. Verify that when
+	// FormulaLayers.City repeats this path, OrdersPath(cityDir) is only
+	// added to the scan roots once.
 	cityDir := t.TempDir()
-	legacyRoot := filepath.Join(cityDir, ".gc", "formulas", "orders")
-	if err := os.MkdirAll(legacyRoot, 0o755); err != nil {
+	localFormulas := filepath.Join(cityDir, citylayout.FormulasRoot)
+	if err := os.MkdirAll(filepath.Join(cityDir, "orders"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	cfg := &config.City{}
-	cfg.Formulas.Dir = ".gc/formulas"
+	cfg.FormulaLayers.City = []string{localFormulas, localFormulas}
 	roots := cityOrderRoots(cityDir, cfg)
 
 	var count int

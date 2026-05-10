@@ -613,6 +613,15 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	prov.Warnings = append(prov.Warnings, DetectLegacyProviderInheritance(root, path)...)
 	prov.Warnings = append(prov.Warnings, detectLegacyWorkspaceFields(root, path, prov.Workspace)...)
 
+	// Enforce the [formulas].dir = "formulas" fixed convention. A bad
+	// value short-circuits before BuildResolvedProviderCache so we don't
+	// burn cache work on a config that won't load.
+	formulasDirWarnings, err := ValidateFormulasDir(root, path)
+	if err != nil {
+		return nil, nil, err
+	}
+	prov.Warnings = append(prov.Warnings, formulasDirWarnings...)
+
 	// Build the resolved provider cache now that compose + patch have
 	// populated the full provider table. Chain resolution errors
 	// (cycles, unknown base, wrapper-resume missing) surface here so
