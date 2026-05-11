@@ -4536,8 +4536,8 @@ func TestStopSupervisorWithWaitStopsSystemdServiceAfterAckBeforeDone(t *testing.
 					mu.Lock()
 					stopped = true
 					mu.Unlock()
-					io.WriteString(conn, "ok\n") //nolint:errcheck
 					close(ackSent)
+					io.WriteString(conn, "ok\n") //nolint:errcheck
 					select {
 					case <-serviceStopped:
 					case <-time.After(200 * time.Millisecond):
