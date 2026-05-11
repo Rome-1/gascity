@@ -146,6 +146,91 @@ scope = "city"
 	}
 }
 
+func TestLoadWithIncludesSkipsLegacyV1SurfaceWarningsWithoutSchema2Pack(t *testing.T) {
+	cases := []struct {
+		name     string
+		packTOML string
+	}{
+		{name: "no pack toml"},
+		{name: "schema 1 pack", packTOML: `
+[pack]
+name = "legacy-city"
+schema = 1
+`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := fsys.NewFake()
+			fs.Dirs["/city/legacy-pack"] = true
+			fs.Files["/city/legacy-pack/pack.toml"] = []byte(`
+[pack]
+name = "legacy-pack"
+schema = 1
+`)
+			fs.Files["/city/city.toml"] = []byte(`
+[workspace]
+name = "legacy-city"
+includes = ["legacy-pack"]
+default_rig_includes = ["default-pack"]
+
+[[agent]]
+name = "worker"
+
+[packs.legacy]
+source = "legacy-pack"
+`)
+			if tc.packTOML != "" {
+				fs.Files["/city/pack.toml"] = []byte(tc.packTOML)
+			}
+
+			_, prov, err := LoadWithIncludes(fs, "/city/city.toml")
+			if err != nil {
+				t.Fatalf("LoadWithIncludes: %v", err)
+			}
+			for _, w := range prov.Warnings {
+				if IsLegacyV1SurfaceWarning(w) {
+					t.Fatalf("schema-1 city emitted v1-surface warning: %q", w)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadWithIncludesDetectsLegacyV1SurfacesInSchema2Fragments(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+include = ["fragments/legacy.toml"]
+
+[workspace]
+name = "schema2-city"
+`)
+	fs.Files["/city/pack.toml"] = []byte(`
+[pack]
+name = "schema2-city"
+schema = 2
+`)
+	fs.Files["/city/fragments/legacy.toml"] = []byte(`
+[[agent]]
+name = "fragment-worker"
+`)
+
+	_, prov, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	var found bool
+	for _, w := range prov.Warnings {
+		if strings.Contains(w, "/city/fragments/legacy.toml: [[agent]] tables are deprecated") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("fragment legacy agent warning missing from %v", prov.Warnings)
+	}
+}
+
 func TestIsLegacyV1SurfaceWarning(t *testing.T) {
 	hits := DetectLegacyV1Surfaces(&City{
 		Agents: []Agent{{Name: "a"}},
@@ -168,7 +253,7 @@ func TestIsLegacyV1SurfaceWarning(t *testing.T) {
 	}
 }
 
-func TestDetectLegacyV1Surfaces_MentionsMigrationCommand(t *testing.T) {
+func TestDetectLegacyV1Surfaces_MentionsActionableMigrationCommand(t *testing.T) {
 	cfg := &City{
 		Agents: []Agent{{Name: "a"}},
 		Packs:  map[string]PackSource{"p": {}},
@@ -178,9 +263,21 @@ func TestDetectLegacyV1Surfaces_MentionsMigrationCommand(t *testing.T) {
 		},
 	}
 	got := DetectLegacyV1Surfaces(cfg, "city.toml")
+	wantSurfaces := []string{
+		"[[agent]] tables are deprecated",
+		"[packs] is deprecated",
+		"workspace.includes is deprecated",
+		"workspace.default_rig_includes is deprecated",
+	}
 	for i, w := range got {
-		if !strings.Contains(w, "gc doctor --fix") && !strings.Contains(w, "gc import migrate") {
-			t.Errorf("warning %d = %q, expected a migration command reference", i, w)
+		if !strings.Contains(w, wantSurfaces[i]) {
+			t.Errorf("warning %d = %q, want surface %q", i, w, wantSurfaces[i])
+		}
+		if !strings.Contains(w, "Run `gc import migrate` to migrate.") {
+			t.Errorf("warning %d = %q, expected gc import migrate guidance", i, w)
+		}
+		if strings.Contains(w, "gc doctor --fix") {
+			t.Errorf("warning %d = %q, should not recommend gc doctor --fix", i, w)
 		}
 	}
 }

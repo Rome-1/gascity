@@ -19,10 +19,10 @@ func TestSplitStrictConfigWarnings_SiteBindingWarningsAreNonFatal(t *testing.T) 
 
 func TestSplitStrictConfigWarnings_LegacyV1SurfaceWarningsAreNonFatal(t *testing.T) {
 	fatal, nonFatal := splitStrictConfigWarnings([]string{
-		"city.toml: [[agent]] tables are deprecated in v2; use directory-based agents under agents/<name>/. Run `gc doctor --fix` to migrate, or `gc import migrate` for a full pass.",
+		"city.toml: [[agent]] tables are deprecated in v2; use directory-based agents under agents/<name>/. Run `gc import migrate` to migrate.",
 		"city.toml: [packs] is deprecated in v2; use [imports] + packs.lock. Run `gc import migrate` to migrate.",
-		"city.toml: workspace.includes is deprecated in v2; use [imports]. Run `gc doctor --fix` to migrate.",
-		"city.toml: workspace.default_rig_includes is deprecated in v2; use root pack.toml [defaults.rig.imports.<binding>]. Run `gc doctor --fix` to migrate.",
+		"city.toml: workspace.includes is deprecated in v2; use [imports]. Run `gc import migrate` to migrate.",
+		"city.toml: workspace.default_rig_includes is deprecated in v2; use root pack.toml [defaults.rig.imports.<binding>]. Run `gc import migrate` to migrate.",
 		`city agent "mayor" shadows agent of the same name from import "gs"`,
 	})
 

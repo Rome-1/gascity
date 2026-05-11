@@ -31,11 +31,11 @@ func IsLegacyV1SurfaceWarning(warning string) bool {
 
 // DetectLegacyV1Surfaces emits one loud deprecation warning per top-level
 // v1 surface that the supplied configuration still populates. It is meant
-// to run on the freshly-parsed city.toml BEFORE any pack expansion or
-// fragment merging takes place — pack expansion legitimately injects
-// agents (and may merge workspace.includes / default_rig_includes from
-// pack.toml defaults) into the same fields, and we only want to warn
-// about surfaces that the user declared at the city.toml level.
+// to run on freshly-parsed schema-2 city config files BEFORE any pack
+// expansion takes place — pack expansion legitimately injects agents (and
+// may merge workspace.includes / default_rig_includes from pack.toml
+// defaults) into the same fields, and we only want to warn about
+// user-authored city-layer declarations.
 //
 // Calling this function on the post-merge config will produce false
 // positives for cities that consume packs which themselves use [[agent]]
@@ -55,8 +55,7 @@ func DetectLegacyV1Surfaces(cfg *City, source string) []string {
 	if len(cfg.Agents) > 0 {
 		warnings = append(warnings, fmt.Sprintf(
 			"%s: [[agent]] tables are deprecated in v2; use directory-based "+
-				"agents under agents/<name>/. Run `gc doctor --fix` to "+
-				"migrate, or `gc import migrate` for a full pass.",
+				"agents under agents/<name>/. Run `gc import migrate` to migrate.",
 			source))
 	}
 	if len(cfg.Packs) > 0 {
@@ -68,14 +67,14 @@ func DetectLegacyV1Surfaces(cfg *City, source string) []string {
 	if len(cfg.Workspace.Includes) > 0 {
 		warnings = append(warnings, fmt.Sprintf(
 			"%s: workspace.includes is deprecated in v2; use [imports]. "+
-				"Run `gc doctor --fix` to migrate.",
+				"Run `gc import migrate` to migrate.",
 			source))
 	}
 	if len(cfg.Workspace.DefaultRigIncludes) > 0 {
 		warnings = append(warnings, fmt.Sprintf(
 			"%s: workspace.default_rig_includes is deprecated in v2; use "+
 				"root pack.toml [defaults.rig.imports.<binding>]. Run "+
-				"`gc doctor --fix` to migrate.",
+				"`gc import migrate` to migrate.",
 			source))
 	}
 	return warnings
