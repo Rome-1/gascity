@@ -288,6 +288,8 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		ProcessNames:      []string{"cursor-agent"},
 		SupportsHooks:     true,
 		InstructionsFile:  "AGENTS.md",
+		ResumeFlag:        "--resume",
+		ResumeStyle:       "flag",
 	},
 	"copilot": {
 		DisplayName: "GitHub Copilot",
@@ -307,6 +309,8 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		ProcessNames:      []string{"copilot"},
 		SupportsHooks:     true,
 		InstructionsFile:  "AGENTS.md",
+		ResumeFlag:        "--resume",
+		ResumeStyle:       "flag",
 	},
 	"amp": {
 		DisplayName:      "Sourcegraph AMP",
@@ -315,6 +319,8 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		PromptMode:       "arg",
 		ProcessNames:     []string{"amp"},
 		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "threads continue",
+		ResumeStyle:      "subcommand",
 	},
 	"opencode": {
 		DisplayName:      "OpenCode",
@@ -339,6 +345,8 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		PromptMode:       "arg",
 		ProcessNames:     []string{"auggie"},
 		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "--resume",
+		ResumeStyle:      "flag",
 	},
 	"pi": {
 		DisplayName:      "Pi Coding Agent",
