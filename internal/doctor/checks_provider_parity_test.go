@@ -13,6 +13,9 @@ func TestProviderParityCheck_NoConfig(t *testing.T) {
 	if r.Status != StatusOK {
 		t.Fatalf("Status = %v, want StatusOK", r.Status)
 	}
+	if !strings.Contains(r.Message, "no config") {
+		t.Errorf("Message = %q, want mention of no config", r.Message)
+	}
 }
 
 func TestProviderParityCheck_NoAgents(t *testing.T) {
@@ -100,6 +103,67 @@ func TestProviderParityCheck_CityOverrideExtendsBuiltin(t *testing.T) {
 	r := NewProviderParityCheck(cfg).Run(&CheckContext{})
 	if r.Status != StatusOK {
 		t.Fatalf("Status = %v, want StatusOK; details=%v", r.Status, r.Details)
+	}
+}
+
+func TestProviderParityCheck_CustomProviderBaseInheritsBuiltinResume(t *testing.T) {
+	base := "builtin:codex"
+	cfg := &config.City{
+		Agents: []config.Agent{{Name: "coder", Provider: "wrapped-codex"}},
+		Providers: map[string]config.ProviderSpec{
+			"wrapped-codex": {Base: &base},
+		},
+	}
+	r := NewProviderParityCheck(cfg).Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("Status = %v, want StatusOK; details=%v", r.Status, r.Details)
+	}
+}
+
+func TestProviderParityCheck_CommandMatchInheritsBuiltinResume(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{{Name: "helper", Provider: "fast-claude"}},
+		Providers: map[string]config.ProviderSpec{
+			"fast-claude": {Command: "claude"},
+		},
+	}
+	r := NewProviderParityCheck(cfg).Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("Status = %v, want StatusOK; details=%v", r.Status, r.Details)
+	}
+}
+
+func TestProviderParityCheck_AgentResumeCommandSuppressesWarning(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{{
+			Name:          "tester",
+			Provider:      "noresume",
+			ResumeCommand: "noresume --continue {{.SessionKey}}",
+		}},
+		Providers: map[string]config.ProviderSpec{
+			"noresume": {Command: "noresume"},
+		},
+	}
+	r := NewProviderParityCheck(cfg).Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("Status = %v, want StatusOK; details=%v", r.Status, r.Details)
+	}
+}
+
+func TestProviderParityCheck_ExplicitStandaloneBuiltinNameWarns(t *testing.T) {
+	base := ""
+	cfg := &config.City{
+		Agents: []config.Agent{{Name: "standalone", Provider: "claude"}},
+		Providers: map[string]config.ProviderSpec{
+			"claude": {Base: &base, Command: "claude"},
+		},
+	}
+	r := NewProviderParityCheck(cfg).Run(&CheckContext{})
+	if r.Status != StatusWarning {
+		t.Fatalf("Status = %v, want StatusWarning; details=%v", r.Status, r.Details)
+	}
+	if len(r.Details) != 1 || !strings.Contains(r.Details[0], `"claude"`) {
+		t.Fatalf("Details = %v, want one warning for claude", r.Details)
 	}
 }
 

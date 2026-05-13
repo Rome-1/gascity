@@ -539,6 +539,35 @@ fallback = true
 	}
 }
 
+func TestV2DeprecationDoctorFixSurfacesMigrateWarningsInOutput(t *testing.T) {
+	t.Parallel()
+
+	cityDir := t.TempDir()
+	writeDoctorFile(t, cityDir, "city.toml", `
+[workspace]
+name = "legacy-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.md"
+fallback = true
+`)
+	writeDoctorFile(t, cityDir, "prompts/mayor.md", "Hello {{.Agent}}\n")
+
+	var buf bytes.Buffer
+	d := &doctor.Doctor{}
+	d.Register(v2AgentFormatCheck{})
+	d.Run(&doctor.CheckContext{CityPath: cityDir, Verbose: true}, &buf, true)
+
+	got := buf.String()
+	if !strings.Contains(got, "fallback") {
+		t.Fatalf("expected doctor --fix output to include migrate warning; got:\n%s", got)
+	}
+	if !strings.Contains(got, "✓ v2-agent-format") {
+		t.Fatalf("expected doctor --fix output to include fixed check result; got:\n%s", got)
+	}
+}
+
 // TestV2ImportFormatCheckFixMigratesIncludes runs v2ImportFormatCheck.Fix
 // in isolation against a city whose only legacy artifact is
 // workspace.includes — guards the per-Check Fix entry point that the
@@ -586,8 +615,12 @@ default_rig_includes = ["../packs/default-rig"]
 	if !check.CanFix() {
 		t.Fatal("v2DefaultRigImportFormatCheck should advertise CanFix()=true")
 	}
-	if got := check.Run(&doctor.CheckContext{CityPath: cityDir}); got.Status != doctor.StatusWarning {
+	got := check.Run(&doctor.CheckContext{CityPath: cityDir})
+	if got.Status != doctor.StatusWarning {
 		t.Fatalf("pre-fix status = %v, want warning", got.Status)
+	}
+	if !strings.Contains(got.FixHint, "gc doctor --fix") {
+		t.Fatalf("FixHint = %q, want gc doctor --fix hint", got.FixHint)
 	}
 	if err := check.Fix(&doctor.CheckContext{CityPath: cityDir}); err != nil {
 		t.Fatalf("Fix: %v", err)

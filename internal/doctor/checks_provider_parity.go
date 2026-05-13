@@ -10,9 +10,8 @@ import (
 
 // ProviderParityCheck flags providers used by configured agents whose
 // capability fields are likely to silently no-op at runtime. The signal
-// is structural — it inspects the resolved ProviderSpec for each
-// provider that at least one agent in the city references, and warns
-// when:
+// is structural — it inspects each provider after applying the same
+// config resolution semantics used for runtime sessions, and warns when:
 //
 //   - ResumeFlag and ResumeCommand are both empty: every session restart
 //     will silently drop the session-id and start a fresh process
@@ -23,8 +22,6 @@ import (
 // path (NeedsNudgePoller) for them. Flagging it would be noise.
 //
 // Each warning names the provider, what is missing, and the consequence.
-// Built-in providers reuse the canonical preset; city-defined providers
-// in cfg.Providers override or extend them.
 type ProviderParityCheck struct {
 	cfg *config.City
 }
@@ -48,23 +45,23 @@ func (c *ProviderParityCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 
-	specs := providersInUse(c.cfg)
-	if len(specs) == 0 {
+	providers := providersInUse(c.cfg)
+	if len(providers) == 0 {
 		r.Status = StatusOK
 		r.Message = "no providers referenced by configured agents"
 		return r
 	}
 
-	names := make([]string, 0, len(specs))
-	for name := range specs {
+	names := make([]string, 0, len(providers))
+	for name := range providers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	var details []string
 	for _, name := range names {
-		spec := specs[name]
-		if spec.ResumeFlag == "" && spec.ResumeCommand == "" {
+		provider := providers[name]
+		if !provider.hasResume {
 			details = append(details, fmt.Sprintf(
 				"provider %q has no ResumeFlag or ResumeCommand: session restarts will silently drop the session-id and start a fresh process",
 				name))
@@ -89,43 +86,51 @@ func (c *ProviderParityCheck) CanFix() bool { return false }
 // Fix is a no-op.
 func (c *ProviderParityCheck) Fix(_ *CheckContext) error { return nil }
 
-// providersInUse returns the resolved ProviderSpec for every provider
-// that at least one agent in the city references (directly via
-// agent.Provider or implicitly via workspace.Provider). Resolution
-// follows the same order as ResolveProvider: city-defined overrides
-// extend built-ins. Agents that pin StartCommand are skipped because
-// they bypass ProviderSpec entirely.
-func providersInUse(cfg *config.City) map[string]config.ProviderSpec {
-	builtins := config.BuiltinProviders()
-	out := map[string]config.ProviderSpec{}
+type providerResumeState struct {
+	hasResume bool
+}
 
-	add := func(name string) {
-		name = strings.TrimSpace(name)
+// providersInUse returns resume capability state for every provider used by
+// at least one configured agent. It delegates provider inheritance and
+// agent-level overrides to config.ResolveProvider, using a PATH lookup stub
+// because provider-parity checks config semantics rather than host binaries.
+// Agents that pin StartCommand are skipped because they bypass ProviderSpec.
+func providersInUse(cfg *config.City) map[string]providerResumeState {
+	out := map[string]providerResumeState{}
+
+	addResolved := func(agent config.Agent) {
+		resolved, err := config.ResolveProvider(&agent, &cfg.Workspace, cfg.Providers, providerParityLookPath)
+		if err != nil {
+			return
+		}
+		name := strings.TrimSpace(resolved.Name)
 		if name == "" {
 			return
 		}
-		if _, seen := out[name]; seen {
-			return
-		}
-		if city, ok := cfg.Providers[name]; ok {
-			if builtin, hasBuiltin := builtins[name]; hasBuiltin {
-				out[name] = config.MergeProviderOverBuiltin(builtin, city)
-				return
-			}
-			out[name] = city
-			return
-		}
-		if builtin, ok := builtins[name]; ok {
-			out[name] = builtin
+		hasResume := strings.TrimSpace(resolved.ResumeFlag) != "" || strings.TrimSpace(resolved.ResumeCommand) != ""
+		current, seen := out[name]
+		if !seen || (current.hasResume && !hasResume) {
+			out[name] = providerResumeState{hasResume: hasResume}
 		}
 	}
 
+	checkedAgentProvider := false
 	for _, a := range cfg.Agents {
 		if a.StartCommand != "" {
 			continue
 		}
-		add(a.Provider)
+		if strings.TrimSpace(a.Provider) == "" && strings.TrimSpace(cfg.Workspace.Provider) == "" {
+			continue
+		}
+		checkedAgentProvider = true
+		addResolved(a)
 	}
-	add(cfg.Workspace.Provider)
+	if !checkedAgentProvider && len(cfg.Agents) == 0 && strings.TrimSpace(cfg.Workspace.Provider) != "" {
+		addResolved(config.Agent{})
+	}
 	return out
+}
+
+func providerParityLookPath(command string) (string, error) {
+	return command, nil
 }
