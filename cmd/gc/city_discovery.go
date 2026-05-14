@@ -27,6 +27,22 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 		return "", err
 	}
 
+	// When the starting dir is itself the discovery ceiling, the upward-walk
+	// loop below skips it entirely. Inspect it once so an explicit invocation
+	// from a city installed directly at the ceiling (e.g. user `gc` with city
+	// at `/home/gc`) succeeds. We still do not walk past the ceiling, and a
+	// stray runtime root at the ceiling that matches the configured supervisor
+	// root is ignored — preserving the "stray $HOME/.gc" guard.
+	if isCityDiscoveryCeiling(dir, opts.ceilingDirs) {
+		if citylayout.HasCityConfig(dir) {
+			return dir, nil
+		}
+		if citylayout.HasRuntimeRoot(dir) && !isIgnoredLegacyRuntimeRoot(dir, opts.ignoredLegacyRuntime) {
+			return dir, nil
+		}
+		return "", fmt.Errorf("not in a city directory (no city.toml or .gc/ found)")
+	}
+
 	var legacy string
 	for !isCityDiscoveryCeiling(dir, opts.ceilingDirs) {
 		if citylayout.HasCityConfig(dir) {

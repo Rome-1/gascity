@@ -457,6 +457,62 @@ func TestFindCity(t *testing.T) {
 		}
 	})
 
+	t.Run("starting_at_ceiling_finds_city_toml", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+
+		if err := os.WriteFile(filepath.Join(homeDir, "city.toml"), []byte("[workspace]\nname = \"home-city\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := findCity(homeDir)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", homeDir, err)
+		}
+		if got != homeDir {
+			t.Errorf("findCity(%q) = %q, want %q", homeDir, got, homeDir)
+		}
+	})
+
+	t.Run("starting_at_ceiling_finds_legacy_runtime_root", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		// Point the supervisor runtime root somewhere else so $HOME/.gc is a
+		// legitimate legacy city root rather than the ignored supervisor root.
+		t.Setenv("GC_HOME", filepath.Join(homeDir, "supervisor", ".gc"))
+
+		if err := os.MkdirAll(filepath.Join(homeDir, ".gc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := findCity(homeDir)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", homeDir, err)
+		}
+		if got != homeDir {
+			t.Errorf("findCity(%q) = %q, want %q", homeDir, got, homeDir)
+		}
+	})
+
+	t.Run("starting_at_ceiling_ignores_supervisor_runtime_root", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+
+		if err := os.MkdirAll(filepath.Join(homeDir, ".gc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := findCity(homeDir)
+		if err == nil {
+			t.Fatal("findCity() should fail when ceiling dir holds only the supervisor runtime root")
+		}
+		if !strings.Contains(err.Error(), "not in a city directory") {
+			t.Errorf("error = %q, want 'not in a city directory'", err)
+		}
+	})
+
 	t.Run("respects_gc_ceiling_directories", func(t *testing.T) {
 		root := t.TempDir()
 		parent := filepath.Join(root, "parent")
