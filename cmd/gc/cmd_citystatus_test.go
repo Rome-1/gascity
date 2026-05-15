@@ -464,6 +464,39 @@ func TestCityStatusJSONReportsCatalogListError(t *testing.T) {
 	}
 }
 
+func TestCityStatusReportsCatalogListError(t *testing.T) {
+	sp := runtime.NewFake()
+	dops := newFakeDrainOps()
+	oldOpen := openCityStoreAtForStatus
+	openCityStoreAtForStatus = func(string) (beads.Store, error) {
+		return &listErrorStore{Store: beads.NewMemStore()}, nil
+	}
+	t.Cleanup(func() { openCityStoreAtForStatus = oldOpen })
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "city"},
+		Agents: []config.Agent{
+			{Name: "status-checker", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.beads): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doCityStatus(sp, dops, cfg, cityPath, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 (degraded session snapshot); stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gc status: loading session snapshot") || !strings.Contains(stderr.String(), "catalog unavailable") {
+		t.Fatalf("stderr = %q, want session snapshot warning", stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Agents:") || !strings.Contains(out, "status-checker") {
+		t.Fatalf("stdout = %q, want partial text status report", out)
+	}
+}
+
 func TestCityStatusSkipsStoreOpenWhenNoPersistedStoreExists(t *testing.T) {
 	sp := runtime.NewFake()
 	dops := newFakeDrainOps()
