@@ -702,13 +702,22 @@ func openCityMailProvider(stderr io.Writer, cmdName string) (mail.Provider, int)
 
 // eventsProviderName returns the events provider name.
 // Priority: GC_EVENTS env var → city.toml [events].provider → "" (default: file JSONL).
-//
-// Uses peekEventsProvider for the city.toml read instead of the full
-// loadCityConfig path. Full config load runs `git status --porcelain --ignored`
-// against every cached pack-source repo, which fans out into a concurrent
-// scan storm under bd-write bursts (every bd hook execs `gc event emit`).
-// See gastownhall/gascity#2099.
 func eventsProviderName() string {
+	if v := os.Getenv("GC_EVENTS"); v != "" {
+		return v
+	}
+	if cp, err := resolveCity(); err == nil {
+		if cfg, err := loadCityConfig(cp, io.Discard); err == nil && cfg.Events.Provider != "" {
+			return cfg.Events.Provider
+		}
+	}
+	return ""
+}
+
+// fastEventsProviderName returns the events provider name for hook-driven
+// event emission. It intentionally reads only top-level city.toml so bead
+// hooks do not expand imports or validate remote pack caches on every write.
+func fastEventsProviderName() string {
 	if v := os.Getenv("GC_EVENTS"); v != "" {
 		return v
 	}
@@ -720,16 +729,15 @@ func eventsProviderName() string {
 	return ""
 }
 
-// newEventsProvider returns an events.Provider based on the events provider
-// name (env var → city.toml → default) and the given events file path (used
-// as the default backend).
+// newEventsProviderForName returns an events.Provider based on the already
+// resolved provider name and the given events file path (used as the default
+// backend).
 //
 //   - "fake" → in-memory fake (all ops succeed)
 //   - "fail" → broken fake (all ops return errors)
 //   - "exec:<script>" → user-supplied script (absolute path or PATH lookup)
 //   - default → file-backed JSONL provider
-func newEventsProvider(eventsPath string, stderr io.Writer) (events.Provider, error) {
-	v := eventsProviderName()
+func newEventsProviderForName(v, eventsPath string, stderr io.Writer) (events.Provider, error) {
 	if strings.HasPrefix(v, "exec:") {
 		return eventsexec.NewProvider(strings.TrimPrefix(v, "exec:"), stderr), nil
 	}
@@ -746,10 +754,18 @@ func newEventsProvider(eventsPath string, stderr io.Writer) (events.Provider, er
 // openCityEventsProvider resolves the city and returns an events.Provider.
 // Returns (nil, exitCode) on failure.
 func openCityEventsProvider(stderr io.Writer, cmdName string) (events.Provider, int) {
+	return openCityEventsProviderWithName(eventsProviderName, stderr, cmdName)
+}
+
+func openCityEventEmitProvider(stderr io.Writer, cmdName string) (events.Provider, int) {
+	return openCityEventsProviderWithName(fastEventsProviderName, stderr, cmdName)
+}
+
+func openCityEventsProviderWithName(providerName func() string, stderr io.Writer, cmdName string) (events.Provider, int) {
 	// For exec: and test doubles, no city needed.
-	v := eventsProviderName()
+	v := providerName()
 	if strings.HasPrefix(v, "exec:") || v == "fake" || v == "fail" {
-		p, err := newEventsProvider("", stderr)
+		p, err := newEventsProviderForName(v, "", stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
 			return nil, 1
@@ -763,7 +779,7 @@ func openCityEventsProvider(stderr io.Writer, cmdName string) (events.Provider, 
 		return nil, 1
 	}
 	eventsPath := filepath.Join(cityPath, ".gc", "events.jsonl")
-	p, err := newEventsProvider(eventsPath, stderr)
+	p, err := newEventsProviderForName(v, eventsPath, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
 		return nil, 1

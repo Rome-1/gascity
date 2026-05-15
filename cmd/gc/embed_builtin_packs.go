@@ -306,10 +306,9 @@ func peekBeadsProvider(tomlPath string) string {
 // — slow on hosts where a pack source is a large monorepo, and fan-out
 // concurrent across a bd-write burst (see gastownhall/gascity#2099).
 //
-// Trade-off: pack-provided overrides of [events].provider are no longer
-// honored on this fast path. In practice [events].provider is a deployment
-// concern set in city.toml directly (or via the GC_EVENTS env var), so this
-// is acceptable.
+// Trade-off: include/import/pack-provided overrides of [events].provider are
+// not honored on this hook fast path. Operators that need this path to bypass
+// city.toml should use the GC_EVENTS env var.
 func peekEventsProvider(tomlPath string) string {
 	data, err := os.ReadFile(tomlPath)
 	if err != nil {
