@@ -330,9 +330,12 @@ The formula layer order determines which `order.toml` wins when the
 same order name exists in multiple layers:
 
 1. **City pack formulas** -- from pack referenced in `city.toml`
-2. **City local formulas** -- from `[formulas]` section or `.gc/formulas/`
+2. **City local formulas** -- from the fixed `formulas/` convention
 3. **Rig pack formulas** -- from pack applied to a specific rig
 4. **Rig local formulas** -- from rig's `formulas_dir`
+
+`[formulas].dir` is deprecated. Omit the `[formulas]` block; the only
+accepted transitional value is `dir = "formulas"`, which loads with a warning.
 
 A higher-numbered layer completely replaces a lower-numbered layer's
 definition for the same order name. This enables packs to

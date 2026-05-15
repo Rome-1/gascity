@@ -188,7 +188,7 @@ Capabilities activate based on config section presence:
 | 2 | `[daemon]` | Task loop (controller) |
 | 3 | `[[agent]]` with `[agent.pool]` | Multiple agents + pool |
 | 4 | `[mail]` | Messaging |
-| 5 | Formula files + `[formulas]` | Formulas & molecules |
+| 5 | Formula files in `formulas/` | Formulas & molecules |
 | 6 | `[daemon]` health fields | Health monitoring |
 | 7 | `orders/` directories | Orders |
 | 8 | All sections | Full orchestration |

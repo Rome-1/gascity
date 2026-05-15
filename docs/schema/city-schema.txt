@@ -1251,13 +1251,13 @@
       "properties": {
         "dir": {
           "type": "string",
-          "description": "Dir is the path to the formulas directory. Defaults to \"formulas\".",
-          "default": "formulas"
+          "description": "Dir is deprecated. Formula definitions live in the fixed \"formulas/\"\ndirectory; omit this field. The transitional value \"formulas\" still\nloads with a warning, and any other value is rejected.",
+          "deprecated": true
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "FormulasConfig holds formula directory settings."
+      "description": "FormulasConfig holds deprecated formula directory settings for migration."
     },
     "Import": {
       "properties": {

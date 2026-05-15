@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 func TestValidateFormulasDirEmpty(t *testing.T) {
@@ -69,4 +71,167 @@ func TestValidateFormulasDirNonCanonicalHardErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadWithIncludesFormulasDirWarningsUseDefiningSource(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		files  map[string][]byte
+		source string
+	}{
+		{
+			name: "city",
+			files: map[string][]byte{
+				"/city/city.toml": []byte(`
+[workspace]
+name = "test"
+
+[formulas]
+dir = "formulas"
+`),
+			},
+			source: "/city/city.toml",
+		},
+		{
+			name: "pack",
+			files: map[string][]byte{
+				"/city/city.toml": []byte(`
+[workspace]
+name = "test"
+`),
+				"/city/pack.toml": []byte(`
+[pack]
+name = "test"
+schema = 2
+
+[formulas]
+dir = "formulas"
+`),
+			},
+			source: "/city/pack.toml",
+		},
+		{
+			name: "fragment",
+			files: map[string][]byte{
+				"/city/city.toml": []byte(`
+include = ["fragment.toml"]
+
+[workspace]
+name = "test"
+`),
+				"/city/fragment.toml": []byte(`
+[formulas]
+dir = "formulas"
+`),
+			},
+			source: "/city/fragment.toml",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := fsys.NewFake()
+			for path, data := range tc.files {
+				fs.Files[path] = data
+			}
+
+			_, prov, err := LoadWithIncludes(fs, "/city/city.toml")
+			if err != nil {
+				t.Fatalf("LoadWithIncludes: %v", err)
+			}
+
+			warning := findFormulasDirWarning(prov.Warnings)
+			if warning == "" {
+				t.Fatalf("expected formulas dir warning, got: %v", prov.Warnings)
+			}
+			if !strings.Contains(warning, tc.source) {
+				t.Fatalf("warning source = %q, want %q in %q", warning, tc.source, warning)
+			}
+			if !strings.Contains(warning, "deprecated") {
+				t.Fatalf("warning should mention deprecation, got: %s", warning)
+			}
+		})
+	}
+}
+
+func TestLoadWithIncludesFormulasDirErrorsUseDefiningSource(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		files  map[string][]byte
+		source string
+	}{
+		{
+			name: "city",
+			files: map[string][]byte{
+				"/city/city.toml": []byte(`
+[workspace]
+name = "test"
+
+[formulas]
+dir = ".gc/formulas"
+`),
+			},
+			source: "/city/city.toml",
+		},
+		{
+			name: "pack",
+			files: map[string][]byte{
+				"/city/city.toml": []byte(`
+[workspace]
+name = "test"
+`),
+				"/city/pack.toml": []byte(`
+[pack]
+name = "test"
+schema = 2
+
+[formulas]
+dir = ".gc/formulas"
+`),
+			},
+			source: "/city/pack.toml",
+		},
+		{
+			name: "fragment",
+			files: map[string][]byte{
+				"/city/city.toml": []byte(`
+include = ["fragment.toml"]
+
+[workspace]
+name = "test"
+`),
+				"/city/fragment.toml": []byte(`
+[formulas]
+dir = ".gc/formulas"
+`),
+			},
+			source: "/city/fragment.toml",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := fsys.NewFake()
+			for path, data := range tc.files {
+				fs.Files[path] = data
+			}
+
+			_, _, err := LoadWithIncludes(fs, "/city/city.toml")
+			if err == nil {
+				t.Fatal("expected LoadWithIncludes error, got nil")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.source) {
+				t.Fatalf("error source = %q, want %q in %q", msg, tc.source, msg)
+			}
+			if !strings.Contains(msg, ".gc/formulas") {
+				t.Fatalf("error should include bad value, got: %s", msg)
+			}
+		})
+	}
+}
+
+func findFormulasDirWarning(warnings []string) string {
+	for _, warning := range warnings {
+		if strings.Contains(warning, "[formulas].dir") {
+			return warning
+		}
+	}
+	return ""
 }

@@ -327,11 +327,11 @@ EventsRotationConfig holds file-backed events rotation settings.
 
 ## FormulasConfig
 
-FormulasConfig holds formula directory settings.
+FormulasConfig holds deprecated formula directory settings for migration.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `dir` | string |  | `formulas` | Dir is the path to the formulas directory. Defaults to "formulas". |
+| `dir` | string |  |  | Dir is deprecated. Formula definitions live in the fixed "formulas/" directory; omit this field. The transitional value "formulas" still loads with a warning, and any other value is rejected. |
 
 ## Import
 

@@ -13,6 +13,9 @@ import "fmt"
 //     configs continue to load while users migrate.
 //   - Any other value is a hard error: the convention cannot be overridden.
 //
+// Unlike warning-only validation helpers, this one deliberately returns both
+// warnings and an error. Warnings and errors are mutually exclusive.
+//
 // See docs/packv2/doc-conformance-matrix.md ("Formula directory path") and
 // docs/packv2/skew-analysis.md (FormulasConfig) for the migration rationale.
 func ValidateFormulasDir(cfg *City, source string) ([]string, error) {

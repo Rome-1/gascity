@@ -200,9 +200,12 @@ Closed wisps are purged by the controller's wisp GC in
 Formula layers are assembled from:
 
 - city packs
-- `[formulas].dir` in `city.toml`
+- the fixed city `formulas/` convention
 - rig packs
 - `[[rigs]].formulas_dir`
+
+`[formulas].dir` is deprecated. Omit the `[formulas]` block; the only
+accepted transitional value is `dir = "formulas"`, which loads with a warning.
 
 Rig-scoped formula var defaults live on the rig entry itself:
 

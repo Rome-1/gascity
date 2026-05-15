@@ -303,9 +303,12 @@ name = "my-city"
 FormulaLayers priority (lowest to highest):
 
 1. City pack formulas (from `workspace.pack` or `workspace.packs`)
-2. City local formulas (from `[formulas] dir`)
+2. City local formulas (from the fixed `formulas/` convention)
 3. Rig pack formulas (from `rigs[].pack` or `rigs[].packs`)
 4. Rig local formulas (from `rigs[].formulas_dir`)
+
+`[formulas].dir` is deprecated. Omit the `[formulas]` block; the only
+accepted transitional value is `dir = "formulas"`, which loads with a warning.
 
 ## Testing
 

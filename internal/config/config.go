@@ -1427,10 +1427,12 @@ type DoltConfig struct {
 	ArchiveLevel *int `toml:"archive_level,omitempty" jsonschema:"default=0"`
 }
 
-// FormulasConfig holds formula directory settings.
+// FormulasConfig holds deprecated formula directory settings for migration.
 type FormulasConfig struct {
-	// Dir is the path to the formulas directory. Defaults to "formulas".
-	Dir string `toml:"dir,omitempty" jsonschema:"default=formulas"`
+	// Dir is deprecated. Formula definitions live in the fixed "formulas/"
+	// directory; omit this field. The transitional value "formulas" still
+	// loads with a warning, and any other value is rejected.
+	Dir string `toml:"dir,omitempty" jsonschema_extras:"deprecated=true"`
 }
 
 // OrdersConfig holds order settings.

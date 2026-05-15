@@ -371,9 +371,6 @@ Here's a city with two orders: a frequent lint check (exec, no agent needed) and
 name = "my-city"
 provider = "claude"
 
-[formulas]
-dir = "formulas"
-
 [[agent]]
 name = "worker"
 prompt_template = "prompts/worker.md"

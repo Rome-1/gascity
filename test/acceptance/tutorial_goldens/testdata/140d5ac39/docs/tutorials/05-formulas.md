@@ -552,9 +552,6 @@ A minimal formula-driven workflow:
 name = "my-city"
 provider = "claude"
 
-[formulas]
-dir = "formulas"
-
 [[agent]]
 name = "worker"
 prompt_template = "prompts/worker.md"

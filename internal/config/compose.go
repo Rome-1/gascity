@@ -83,6 +83,8 @@ type Provenance struct {
 	Rigs map[string]string
 	// Workspace maps workspace field name → source file path.
 	Workspace map[string]string
+	// Formulas is the source file that supplied the effective [formulas].dir.
+	Formulas string
 	// Warnings collects non-fatal collision warnings from composition.
 	Warnings []string
 
@@ -121,6 +123,7 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	prov := newProvenance(path)
 	prov.recordSource(path, data)
 	prov.Warnings = append(prov.Warnings, rootWarnings...)
+	trackFormulas(prov, rootMeta, path)
 	cityAgentsForProvenance := root.Agents
 	root.Pricing = dedupePricingByKey(root.Pricing)
 	root.CityPricing = append([]pricing.ModelPricing(nil), root.Pricing...)
@@ -252,6 +255,7 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 		// the more local override.
 		if root.Formulas.Dir == "" {
 			root.Formulas = pc.Formulas
+			trackFormulas(prov, md, packPath)
 		}
 		// Merge pack-level agent defaults before city fragments so the
 		// city layer can append on top of the portable baseline.
@@ -613,10 +617,10 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	prov.Warnings = append(prov.Warnings, DetectLegacyProviderInheritance(root, path)...)
 	prov.Warnings = append(prov.Warnings, detectLegacyWorkspaceFields(root, path, prov.Workspace)...)
 
-	// Enforce the [formulas].dir = "formulas" fixed convention. A bad
-	// value short-circuits before BuildResolvedProviderCache so we don't
-	// burn cache work on a config that won't load.
-	formulasDirWarnings, err := ValidateFormulasDir(root, path)
+	// Enforce the [formulas].dir = "formulas" fixed convention after pack
+	// and fragment merges populate root.Formulas. A bad value short-circuits
+	// before BuildResolvedProviderCache, the most expensive remaining step.
+	formulasDirWarnings, err := ValidateFormulasDir(root, prov.formulasSource(path))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -917,6 +921,7 @@ func mergeFragment(base, fragment *City, fragMeta toml.MetaData, fragPath string
 	}
 	if fragMeta.IsDefined("formulas") {
 		base.Formulas = fragment.Formulas
+		trackFormulas(prov, fragMeta, fragPath)
 	}
 	if fragMeta.IsDefined("daemon") {
 		base.Daemon = fragment.Daemon
@@ -1402,9 +1407,22 @@ func (p *Provenance) recordSource(path string, data []byte) {
 	p.sourceContents[path] = cp
 }
 
+func (p *Provenance) formulasSource(fallback string) string {
+	if p == nil || p.Formulas == "" {
+		return fallback
+	}
+	return p.Formulas
+}
+
 func trackAgents(prov *Provenance, agents []Agent, source string) {
 	for _, a := range agents {
 		prov.Agents[a.QualifiedName()] = source
+	}
+}
+
+func trackFormulas(prov *Provenance, meta toml.MetaData, source string) {
+	if prov != nil && meta.IsDefined("formulas", "dir") {
+		prov.Formulas = source
 	}
 }
 
