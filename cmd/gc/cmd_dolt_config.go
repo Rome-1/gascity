@@ -145,6 +145,9 @@ data_dir: %q
 # auto_gc is disabled — dolt#10944 load-avg gating means upstream auto-GC effectively never fires.
 # Compaction-driven scheduled GC replaces it. See gastownhall/gascity#1918, #1200, #1977 for context.
 behavior:
+  # auto_gc is disabled — dolt#10944 load-avg gating means upstream auto-GC
+  # effectively never fires. Compaction-driven scheduled GC replaces it. See
+  # gastownhall/gascity#1918, #1200, #1977 for context.
   auto_gc_behavior:
     enable: false
     archive_level: %d
