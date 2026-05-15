@@ -702,13 +702,19 @@ func openCityMailProvider(stderr io.Writer, cmdName string) (mail.Provider, int)
 
 // eventsProviderName returns the events provider name.
 // Priority: GC_EVENTS env var → city.toml [events].provider → "" (default: file JSONL).
+//
+// Uses peekEventsProvider for the city.toml read instead of the full
+// loadCityConfig path. Full config load runs `git status --porcelain --ignored`
+// against every cached pack-source repo, which fans out into a concurrent
+// scan storm under bd-write bursts (every bd hook execs `gc event emit`).
+// See gastownhall/gascity#2099.
 func eventsProviderName() string {
 	if v := os.Getenv("GC_EVENTS"); v != "" {
 		return v
 	}
 	if cp, err := resolveCity(); err == nil {
-		if cfg, err := loadCityConfig(cp, io.Discard); err == nil && cfg.Events.Provider != "" {
-			return cfg.Events.Provider
+		if p := peekEventsProvider(filepath.Join(cp, "city.toml")); p != "" {
+			return p
 		}
 	}
 	return ""
