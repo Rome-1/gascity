@@ -27,23 +27,8 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 		return "", err
 	}
 
-	// Always check the starting directory itself, even when it is also the
-	// discovery ceiling. The ceiling is still included in upward discovery,
-	// but it is the final directory searched before traversal stops.
-	if citylayout.HasCityConfig(dir) {
-		return dir, nil
-	}
 	var legacy string
-	if citylayout.HasRuntimeRoot(dir) && !isIgnoredLegacyRuntimeRoot(dir, opts.ignoredLegacyRuntime) {
-		legacy = dir
-	}
-
 	for {
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
 		if citylayout.HasCityConfig(dir) {
 			return dir, nil
 		}
@@ -53,6 +38,11 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 		if isCityDiscoveryCeiling(dir, opts.ceilingDirs) {
 			break
 		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
 	}
 	if legacy != "" {
 		return legacy, nil
