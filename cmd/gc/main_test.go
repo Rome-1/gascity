@@ -398,7 +398,7 @@ func TestFindCity(t *testing.T) {
 		}
 	})
 
-	t.Run("not_found_ignores_stray_home_city_toml", func(t *testing.T) {
+	t.Run("checks_home_ceiling_dir_last", func(t *testing.T) {
 		homeDir := t.TempDir()
 		t.Setenv("HOME", homeDir)
 		t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
@@ -411,12 +411,12 @@ func TestFindCity(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := findCity(dir)
-		if err == nil {
-			t.Fatal("findCity() should fail when only a stray $HOME/city.toml exists")
+		got, err := findCity(dir)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", dir, err)
 		}
-		if !strings.Contains(err.Error(), "not in a city directory") {
-			t.Errorf("error = %q, want 'not in a city directory'", err)
+		if got != homeDir {
+			t.Errorf("findCity(%q) = %q, want %q", dir, got, homeDir)
 		}
 	})
 
@@ -513,7 +513,7 @@ func TestFindCity(t *testing.T) {
 		}
 	})
 
-	t.Run("respects_gc_ceiling_directories", func(t *testing.T) {
+	t.Run("checks_explicit_ceiling_dir_last", func(t *testing.T) {
 		root := t.TempDir()
 		parent := filepath.Join(root, "parent")
 		if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -528,9 +528,33 @@ func TestFindCity(t *testing.T) {
 		}
 		t.Setenv("GC_CEILING_DIRECTORIES", parent)
 
+		got, err := findCity(dir)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", dir, err)
+		}
+		if got != parent {
+			t.Errorf("findCity(%q) = %q, want %q", dir, got, parent)
+		}
+	})
+
+	t.Run("does_not_search_above_explicit_ceiling_dir", func(t *testing.T) {
+		root := t.TempDir()
+		ceiling := filepath.Join(root, "ceiling")
+		if err := os.MkdirAll(ceiling, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "city.toml"), []byte("[workspace]\nname = \"root\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(ceiling, "child", "deep")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GC_CEILING_DIRECTORIES", ceiling)
+
 		_, err := findCity(dir)
 		if err == nil {
-			t.Fatal("findCity() should fail when GC_CEILING_DIRECTORIES excludes the ancestor city root")
+			t.Fatal("findCity() should fail when only an ancestor above the ceiling has city.toml")
 		}
 		if !strings.Contains(err.Error(), "not in a city directory") {
 			t.Errorf("error = %q, want 'not in a city directory'", err)

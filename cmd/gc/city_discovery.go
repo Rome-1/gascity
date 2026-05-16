@@ -27,10 +27,9 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 		return "", err
 	}
 
-	// Always check the starting directory itself — even if it sits at the
-	// discovery ceiling (e.g. cwd == $HOME). The ceiling exists to bound
-	// upward resolution to an unrelated ancestor; a city the user is
-	// standing directly inside should still be found.
+	// Always check the starting directory itself, even when it is also the
+	// discovery ceiling. The ceiling is still included in upward discovery,
+	// but it is the final directory searched before traversal stops.
 	if citylayout.HasCityConfig(dir) {
 		return dir, nil
 	}
@@ -45,14 +44,14 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 			break
 		}
 		dir = parent
-		if isCityDiscoveryCeiling(dir, opts.ceilingDirs) {
-			break
-		}
 		if citylayout.HasCityConfig(dir) {
 			return dir, nil
 		}
 		if legacy == "" && citylayout.HasRuntimeRoot(dir) && !isIgnoredLegacyRuntimeRoot(dir, opts.ignoredLegacyRuntime) {
 			legacy = dir
+		}
+		if isCityDiscoveryCeiling(dir, opts.ceilingDirs) {
+			break
 		}
 	}
 	if legacy != "" {
