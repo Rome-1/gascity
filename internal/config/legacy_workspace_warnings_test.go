@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 func TestDetectLegacyWorkspaceFields(t *testing.T) {
@@ -18,7 +20,7 @@ func TestDetectLegacyWorkspaceFields(t *testing.T) {
 			name:      "provider populated",
 			workspace: Workspace{Provider: "claude"},
 			wantField: "workspace.provider",
-			wantHint:  "[agent_defaults] provider",
+			wantHint:  "provider per agent in agents/<name>/agent.toml",
 		},
 		{
 			name:      "start_command populated",
@@ -30,13 +32,13 @@ func TestDetectLegacyWorkspaceFields(t *testing.T) {
 			name:      "suspended true",
 			workspace: Workspace{Suspended: true},
 			wantField: "workspace.suspended",
-			wantHint:  "`gc suspend`",
+			wantHint:  "No action is required",
 		},
 		{
 			name:      "install_agent_hooks populated",
 			workspace: Workspace{InstallAgentHooks: []string{"claude"}},
 			wantField: "workspace.install_agent_hooks",
-			wantHint:  "[agent_defaults]",
+			wantHint:  "install_agent_hooks per agent in agents/<name>/agent.toml",
 		},
 		{
 			name:      "global_fragments populated",
@@ -66,6 +68,28 @@ func TestDetectLegacyWorkspaceFields(t *testing.T) {
 				t.Errorf("warning missing replacement hint %q: %q", tt.wantHint, w)
 			}
 		})
+	}
+}
+
+func TestIsLegacyWorkspaceFieldWarning(t *testing.T) {
+	t.Parallel()
+	warnings := DetectLegacyWorkspaceFields(&City{Workspace: Workspace{
+		Provider:          "claude",
+		StartCommand:      "claude",
+		Suspended:         true,
+		InstallAgentHooks: []string{"claude"},
+		GlobalFragments:   []string{"shared"},
+	}}, "city.toml")
+	if len(warnings) != 5 {
+		t.Fatalf("len(warnings) = %d, want 5", len(warnings))
+	}
+	for _, warning := range warnings {
+		if !IsLegacyWorkspaceFieldWarning(warning) {
+			t.Errorf("IsLegacyWorkspaceFieldWarning(%q) = false, want true", warning)
+		}
+	}
+	if IsLegacyWorkspaceFieldWarning("city.toml: workspace.name redefined by fragment.toml") {
+		t.Error("IsLegacyWorkspaceFieldWarning matched unrelated workspace warning")
 	}
 }
 
@@ -119,4 +143,72 @@ func TestDetectLegacyWorkspaceFields_AllFieldsStableOrder(t *testing.T) {
 			t.Errorf("warning[%d] = %q, want to reference %s", i, warnings[i], want)
 		}
 	}
+}
+
+func TestLoadWithIncludesEmitsNonFatalLegacyWorkspaceWarning(t *testing.T) {
+	t.Parallel()
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+[workspace]
+name = "legacy-workspace"
+provider = "claude"
+`)
+
+	_, prov, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	var found bool
+	for _, warning := range prov.Warnings {
+		if strings.Contains(warning, "workspace.provider is deprecated:") {
+			found = true
+			if !IsLegacyWorkspaceFieldWarning(warning) {
+				t.Fatalf("legacy workspace warning is not classified as non-fatal: %q", warning)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("missing workspace.provider deprecation warning in %v", prov.Warnings)
+	}
+}
+
+func TestLoadWithIncludesLegacyWorkspaceWarningsUseFragmentSource(t *testing.T) {
+	t.Parallel()
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+include = ["fragment.toml"]
+
+[workspace]
+name = "legacy-workspace"
+`)
+	fs.Files["/city/fragment.toml"] = []byte(`
+[workspace]
+provider = "claude"
+global_fragments = ["shared"]
+`)
+
+	_, prov, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	for _, field := range []string{"provider", "global_fragments"} {
+		want := "/city/fragment.toml: workspace." + field + " is deprecated:"
+		if !containsWarningPrefix(prov.Warnings, want) {
+			t.Fatalf("missing fragment-sourced %s warning with prefix %q in %v", field, want, prov.Warnings)
+		}
+		wrong := "/city/city.toml: workspace." + field + " is deprecated:"
+		if containsWarningPrefix(prov.Warnings, wrong) {
+			t.Fatalf("warning for fragment-authored %s was attributed to root: %v", field, prov.Warnings)
+		}
+	}
+}
+
+func containsWarningPrefix(warnings []string, prefix string) bool {
+	for _, warning := range warnings {
+		if strings.HasPrefix(warning, prefix) {
+			return true
+		}
+	}
+	return false
 }
