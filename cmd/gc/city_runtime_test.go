@@ -3400,11 +3400,15 @@ func TestCityRuntimeReloadDrainShortCircuitsOnTickContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	lastProviderName := "fake"
-	start := time.Now()
 	cr.reloadConfig(ctx, &lastProviderName, cityPath)
-	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
-		t.Fatalf("reload drain took %s after tick context cancellation, want <200ms", elapsed)
-	}
+	// The behavioral signal for the short-circuit is the drain ctx error:
+	// drain() selects on release vs ctx.Done() and `release` is never
+	// closed before reloadConfig returns. If reloadConfig stopped
+	// propagating the cancelled tick ctx through reloadOrderDrainTimeout's
+	// context.WithTimeout(ctx, ...), drain would block until go test's
+	// own timeout, not slow-pass. A prior 200ms wall-clock bound here
+	// flaked on loaded hosts because reloadConfig's LoadWithIncludes
+	// step is filesystem-bound and dominated the measurement (ga-d2k).
 	errs := od.drainContextErrors()
 	if len(errs) == 0 || !errors.Is(errs[0], context.Canceled) {
 		t.Fatalf("drain ctx error = %v, want context.Canceled", errs)
