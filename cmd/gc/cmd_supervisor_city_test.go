@@ -314,8 +314,14 @@ func TestRegisterCityWithSupervisorFailsFastWhenSupervisorStopsDuringWait(t *tes
 	if waitStarted.IsZero() {
 		t.Fatal("supervisor wait path was not reached")
 	}
-	if elapsed := time.Since(waitStarted); elapsed > 250*time.Millisecond {
-		t.Fatalf("registerCityWithSupervisor took %v, want fast failure when supervisor stops", elapsed)
+	// Fast failure means the wait loop exits on detection rather than
+	// polling until the 5s timeout. waitForSupervisorCity calls the alive
+	// hook once per iteration; two calls (alive, then stopped) is the
+	// minimum that proves the supervisor-stopped branch returned
+	// immediately. Counting calls is deterministic; the prior wall-clock
+	// bound flaked on loaded hosts (ga-b4k).
+	if aliveChecks != 2 {
+		t.Fatalf("aliveChecks = %d, want 2 (alive then stopped) — function did not exit on detection", aliveChecks)
 	}
 	if !strings.Contains(stderr.String(), "keeping registration") {
 		t.Fatalf("stderr = %q, want keep-registration message", stderr.String())
