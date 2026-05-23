@@ -3777,6 +3777,13 @@ func TestCityRuntimeManualReloadPanicAfterReloadKeepsReloadReplyAndClears(t *tes
 		Stdout: io.Discard,
 		Stderr: &stderr,
 	})
+	// Replace the real dispatcher (which spawns exec subprocesses for
+	// embedded maintenance orders) with a no-op recorder. The test is
+	// scoped to panic recovery in BuildFn; letting real orders fire racks
+	// up writes to cityPath that race t.TempDir cleanup after the panic
+	// (ga-5wf).
+	cancelInflight(cr.od)
+	cr.od = &recordingOrderDispatcher{}
 	cr.activeReload = &reloadRequest{doneCh: doneCh}
 	lastProviderName := "fake"
 	var prevPoolRunning map[string]bool
