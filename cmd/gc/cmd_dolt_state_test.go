@@ -858,7 +858,12 @@ func TestDoltStateInspectManagedCmdDetectsDeletedInodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
 	}
-	proc := exec.Command("python3", "-c", `
+	// The python helper signals readiness on stdout AFTER opening and
+	// unlinking the file, so the test only inspects the process once the
+	// deleted-inode condition is actually established. Some CI hosts have
+	// 3+ second python3 startup, which used to race past the inspection's
+	// internal retry loop.
+	proc := exec.Command("python3", "-u", "-c", `
 import os, signal, sys, time
 path = sys.argv[1]
 os.makedirs(path, exist_ok=True)
@@ -867,11 +872,17 @@ f = open(stale, "w+")
 f.write("stale")
 f.flush()
 os.unlink(stale)
+sys.stdout.write("ready\n")
+sys.stdout.flush()
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 while True:
     time.sleep(1)
 `, layout.DataDir)
+	stdoutPipe, err := proc.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
 	if err := proc.Start(); err != nil {
 		t.Fatalf("start python: %v", err)
 	}
@@ -879,6 +890,19 @@ while True:
 		_ = proc.Process.Kill()
 		_, _ = proc.Process.Wait()
 	}()
+	readyCh := make(chan struct{})
+	go func() {
+		buf := make([]byte, 64)
+		n, _ := stdoutPipe.Read(buf)
+		if n > 0 && strings.Contains(string(buf[:n]), "ready") {
+			close(readyCh)
+		}
+	}()
+	select {
+	case <-readyCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("python helper did not signal ready within 30s")
+	}
 	if err := os.MkdirAll(filepath.Dir(layout.PIDFile), 0o755); err != nil {
 		t.Fatal(err)
 	}
