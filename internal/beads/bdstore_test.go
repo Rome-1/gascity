@@ -4430,6 +4430,11 @@ func TestBdStoreListWispsFallsBackToClientFilteringForUnsafeQueryValues(t *testi
 			query: beads.ListQuery{Type: "or", TierMode: beads.TierWisps},
 			want:  "bd-match-type",
 		},
+		{
+			name:  "digit-prefixed assignee",
+			query: beads.ListQuery{Assignee: "3-recurse", Type: "message", Status: "open", TierMode: beads.TierWisps},
+			want:  "bd-match-digit-assignee",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -4441,6 +4446,7 @@ func TestBdStoreListWispsFallsBackToClientFilteringForUnsafeQueryValues(t *testi
 					{"id":"bd-match-assignee","title":"message","status":"open","issue_type":"message","assignee":"gascity/workflows.codex-max","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
 					{"id":"bd-match-label","title":"label","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","ephemeral":true,"labels":["order tracking"]},
 					{"id":"bd-match-type","title":"reserved","status":"open","issue_type":"or","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
+					{"id":"bd-match-digit-assignee","title":"digit-prefixed","status":"open","issue_type":"message","assignee":"3-recurse","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
 					{"id":"bd-other","title":"other","status":"open","issue_type":"task","assignee":"someone-else","created_at":"2026-05-01T00:00:00Z","ephemeral":true}
 				]`), nil
 			}
@@ -4472,6 +4478,10 @@ func TestBdStoreListWispsFallsBackToClientFilteringForUnsafeQueryValues(t *testi
 			case "type reserved token":
 				if strings.Contains(queryCmd, "type=or") {
 					t.Fatalf("query cmd = %q, reserved type token must be client-filtered", queryCmd)
+				}
+			case "digit-prefixed assignee":
+				if strings.Contains(queryCmd, "assignee=3-recurse") {
+					t.Fatalf("query cmd = %q, digit-prefixed assignee trips bd query lexer and must be client-filtered", queryCmd)
 				}
 			}
 			if len(got) != 1 || got[0].ID != tc.want {

@@ -2207,8 +2207,18 @@ func appendBdQueryClause(clauses []string, serverFilteredOnly bool, field, value
 }
 
 func isBareBdQueryValue(value string) bool {
+	if value == "" {
+		return false
+	}
 	upper := strings.ToUpper(value)
 	if upper == "AND" || upper == "OR" || upper == "NOT" {
+		return false
+	}
+	// The bd query lexer treats a digit-led token as a numeric literal and
+	// errors at the first non-digit byte. Values like "3-recurse" must fall
+	// back to the client-side filter path instead of being inlined into the
+	// query string.
+	if value[0] >= '0' && value[0] <= '9' {
 		return false
 	}
 	for _, r := range value {
