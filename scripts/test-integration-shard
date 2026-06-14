@@ -20,6 +20,43 @@ gomodcache_val="$(go env GOMODCACHE)"
 gotmpdir_val="$(go env GOTMPDIR)"
 goroot_val="$(go env GOROOT)"
 
+# Pick a TMPDIR that supports executable files. Some sandboxes mount /tmp
+# with noexec, which causes "fork/exec ...: permission denied" when go test
+# tries to run the compiled test binary it places under TMPDIR. Prefer
+# (in order): caller-supplied TMPDIR, GOTMPDIR, /tmp, and finally a directory
+# under HOME — but skip any that is not exec-capable.
+exec_capable_dir() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" && -w "$dir" ]] || return 1
+  local probe
+  probe="$(mktemp "${dir}/gctmpprobe.XXXXXX" 2>/dev/null)" || return 1
+  printf '#!/bin/sh\nexit 0\n' >"$probe"
+  chmod +x "$probe" 2>/dev/null || { rm -f "$probe"; return 1; }
+  if "$probe" >/dev/null 2>&1; then
+    rm -f "$probe"
+    return 0
+  fi
+  rm -f "$probe"
+  return 1
+}
+
+tmpdir_val=""
+for candidate in "${TMPDIR:-}" "${gotmpdir_val}" "/tmp"; do
+  if exec_capable_dir "$candidate"; then
+    tmpdir_val="$candidate"
+    break
+  fi
+done
+if [[ -z "$tmpdir_val" ]]; then
+  if [[ -n "${HOME:-}" ]] && exec_capable_dir "$HOME"; then
+    tmpdir_val="$(mktemp -d "${HOME}/gctmp.XXXXXX")"
+    trap 'rm -rf "$tmpdir_val"' EXIT
+  else
+    echo "test-integration-shard: no exec-capable TMPDIR found (tried TMPDIR, GOTMPDIR, /tmp, HOME)" >&2
+    exit 1
+  fi
+fi
+
 run_go_test() {
   env -i \
     PATH="${PATH}" \
@@ -28,7 +65,7 @@ run_go_test() {
     LOGNAME="${LOGNAME:-}" \
     SHELL="${SHELL:-/bin/sh}" \
     LANG="${LANG:-C.UTF-8}" \
-    TMPDIR="${TMPDIR:-/tmp}" \
+    TMPDIR="${tmpdir_val}" \
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
     GOPATH="${gopath_val}" \
     GOCACHE="${gocache_val}" \
