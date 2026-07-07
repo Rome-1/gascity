@@ -1316,6 +1316,15 @@ func supervisorSystemdServiceName() string {
 	return defaultSupervisorSystemdUnit
 }
 
+// supervisorLaunchdTemplate has no equivalent of systemd's
+// RestartPreventExitStatus: launchd's KeepAlive dict below has no
+// per-exit-code / LastExitStatus key, so a duplicate supervisor that exits
+// with supervisorExitCodePortInUse (see cmd_supervisor.go) is still
+// "Crashed" (any nonzero exit) and gets restarted regardless of exit code.
+// The port-in-use message is worded accordingly on darwin (see
+// supervisorPortInUseMessage) instead of falsely claiming "without restart".
+// Real macOS duplicate-instance suppression is a different mechanism and is
+// tracked separately: gc-s53wv.
 const supervisorLaunchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
