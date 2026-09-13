@@ -27,7 +27,7 @@ func TestQualityGateFallbackInFormulas(t *testing.T) {
 		"test_command": "pnpm test", "base_branch": "main", "issue": "test-123",
 	}
 
-	t.Run("preflight-tests fallback when commands empty", func(t *testing.T) {
+	t.Run("preflight-tests step contains fallback guidance", func(t *testing.T) {
 		step := findStep(recipe.Steps, "mol-polecat-base.preflight-tests")
 		if step == nil {
 			t.Fatal("preflight-tests step not found")
@@ -38,7 +38,7 @@ func TestQualityGateFallbackInFormulas(t *testing.T) {
 		}
 	})
 
-	t.Run("self-review fallback when commands empty", func(t *testing.T) {
+	t.Run("self-review step contains fallback guidance", func(t *testing.T) {
 		step := findStep(recipe.Steps, "mol-polecat-base.self-review")
 		if step == nil {
 			t.Fatal("self-review step not found")
