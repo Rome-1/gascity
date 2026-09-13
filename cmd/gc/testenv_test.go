@@ -6,6 +6,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/pathutil"
 )
 
 // gcEnvVars lists the GC_* identity and session-routing variables that
@@ -50,6 +53,13 @@ var liveTestEnvVars = []string{
 	"GC_PROVIDER",
 	"GC_READY_PROMPT_PREFIX",
 	"GC_STARTUP_PROMPT_DELIVERED",
+	// Inherited systemd delegation env makes existing lifecycle tests
+	// take the delegated branch and exec PATH-resolved systemctl against
+	// the operator's real unit (including stop). The dynamic GC_* environ
+	// scan in liveEnvKeysForTests already catches these today; listing
+	// them pins the protection explicitly.
+	"GC_SUPERVISOR_SYSTEMD_SCOPE",
+	"GC_SUPERVISOR_SYSTEMD_UNIT",
 }
 
 // inheritedCityRoutingEnvVars lists GC_* variables that an outer gc-managed
@@ -78,7 +88,12 @@ func clearGCEnv(t *testing.T) {
 	for _, k := range liveEnvKeysForTests() {
 		t.Setenv(k, "")
 	}
-	t.Setenv("GC_HOME", filepath.Join(t.TempDir(), "gc-home"))
+	td := t.TempDir()
+	t.Setenv("GC_HOME", filepath.Join(td, "gc-home"))
+	// Prevent city discovery from walking above the test temp dir and finding
+	// a .gc/ directory left by a running city or a prior test run in /tmp
+	// (e.g. a developer box hosting a live city contaminates no-city tests).
+	t.Setenv("GC_CEILING_DIRECTORIES", filepath.Dir(td))
 }
 
 func clearProcessLiveEnvForTests() {
@@ -99,10 +114,15 @@ func TestClearProcessLiveEnvForTestsUnsetsInheritedState(t *testing.T) {
 		"GC_RIG",
 		"GC_RIG_ROOT",
 		"GC_SESSION_NAME",
+		"GC_SUPERVISOR_SYSTEMD_SCOPE",
+		"GC_SUPERVISOR_SYSTEMD_UNIT",
 	}
 	preserved := []string{
 		"GC_FAST_UNIT",
+		"GC_HERDR_LIVE_TESTS",
+		"GC_REAL_PROCESS_SIGNAL_TESTS",
 		"GC_TEST_KEEP",
+		"GC_WORKER_REPORT_DIR",
 	}
 
 	for _, key := range append(cleared, preserved...) {
@@ -171,12 +191,24 @@ func liveEnvKeysForTests() []string {
 
 func preserveTestControlEnv(key string) bool {
 	return key == "GC_FAST_UNIT" ||
+		key == "GC_REAL_PROCESS_SIGNAL_TESTS" ||
+		key == "GC_WORKER_REPORT_DIR" ||
 		key == managedDoltTestModeEnv ||
 		key == managedDoltTestParentPIDEnv ||
 		key == "GC_DOLT_REAL_BINARY" ||
+		// The live herdr tier's opt-in. Without it here the scrub below would
+		// strip the variable before any cmd/gc live journey could read it, so
+		// `make test-herdr-live` could never reach the journeys in this package.
+		key == "GC_HERDR_LIVE_TESTS" ||
 		strings.HasPrefix(key, "GC_LIVE_") ||
 		strings.HasPrefix(key, "GC_SESSION_CHAOS_") ||
 		strings.HasPrefix(key, "GC_TEST_")
+}
+
+func TestPreserveTestControlEnvKeepsRealProcessSignalGate(t *testing.T) {
+	if !preserveTestControlEnv("GC_REAL_PROCESS_SIGNAL_TESTS") {
+		t.Fatal("GC_REAL_PROCESS_SIGNAL_TESTS must survive cmd/gc test env scrubbing")
+	}
 }
 
 // isTestscriptCommandInvocation reports whether this process is a
@@ -216,6 +248,8 @@ var testProviderStubCommands = []string{
 	"copilot",
 	"amp",
 	"opencode",
+	"mimo",
+	"zcode-repl",
 	"auggie",
 	"pi",
 	"omp",
@@ -234,6 +268,34 @@ func installTestProviderStubs() (string, error) {
 		}
 	}
 	return dir, nil
+}
+
+func builtinProviderAliasesForTest(names ...string) map[string]config.ProviderSpec {
+	providers := make(map[string]config.ProviderSpec, len(names))
+	for _, name := range names {
+		providers[name] = config.BuiltinProviderAlias(name)
+	}
+	return providers
+}
+
+func builtinProviderAliasTOMLForTest(names ...string) string {
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString("\n[providers.")
+		b.WriteString(name)
+		b.WriteString("]\nbase = \"builtin:")
+		b.WriteString(name)
+		b.WriteString("\"\n")
+	}
+	return b.String()
+}
+
+func withBuiltinProviderAliasesTOMLForTest(content string, names ...string) string {
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return strings.TrimLeft(builtinProviderAliasTOMLForTest(names...), "\n")
+	}
+	return content + "\n" + builtinProviderAliasTOMLForTest(names...)
 }
 
 func TestInstallTestProviderStubsUsesPIDPrefixedDir(t *testing.T) {
@@ -287,13 +349,27 @@ func writeTestDoltIdentity(homeDir string) error {
 	return os.WriteFile(filepath.Join(doltDir, "config_global.json"), data, 0o644)
 }
 
+// doltIdentityHomeDir returns a fresh directory for dolt/git identity files,
+// created outside every t.TempDir() tree rather than nested inside one.
+// t.TempDir()'s cleanup is a single-pass, non-retrying RemoveAll on its
+// shared parent (see ga-7dgcg6); a dolt/bd child process still writing
+// under DOLT_ROOT_PATH when that RemoveAll fires turns an otherwise-passing
+// test into an ENOTEMPTY failure. Cleanup here is best-effort so a lingering
+// writer fails only this directory's own removal, not the whole test tree.
+func doltIdentityHomeDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(os.TempDir(), "gc-dolt-identity-")
+	if err != nil {
+		t.Fatalf("MkdirTemp(dolt identity home): %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func configureTestDoltIdentityEnv(t *testing.T) {
 	t.Helper()
 
-	homeDir := filepath.Join(t.TempDir(), "home")
-	if err := os.MkdirAll(homeDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(test home): %v", err)
-	}
+	homeDir := doltIdentityHomeDir(t)
 	if err := writeTestGitIdentity(homeDir); err != nil {
 		t.Fatalf("write test git identity: %v", err)
 	}
@@ -303,4 +379,24 @@ func configureTestDoltIdentityEnv(t *testing.T) {
 	t.Setenv("HOME", homeDir)
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(homeDir, ".gitconfig"))
 	t.Setenv("DOLT_ROOT_PATH", homeDir)
+}
+
+// TestConfigureTestDoltIdentityEnvHomeIsOutsideTestTempDir guards against
+// ga-7dgcg6: a live dolt/bd child process rooted under DOLT_ROOT_PATH can
+// still be writing when this test's t.TempDir() runs its single-pass
+// RemoveAll, turning an otherwise-passing test into an ENOTEMPTY failure.
+// DOLT_ROOT_PATH must live outside every t.TempDir() this test allocates.
+func TestConfigureTestDoltIdentityEnvHomeIsOutsideTestTempDir(t *testing.T) {
+	marker := t.TempDir()
+	tempRoot := filepath.Dir(marker)
+
+	configureTestDoltIdentityEnv(t)
+
+	doltRoot := os.Getenv("DOLT_ROOT_PATH")
+	if doltRoot == "" {
+		t.Fatal("DOLT_ROOT_PATH not set by configureTestDoltIdentityEnv")
+	}
+	if pathutil.PathWithin(tempRoot, doltRoot) {
+		t.Fatalf("DOLT_ROOT_PATH %q must not live under this test's t.TempDir() root %q — a live child process still writing there when t.TempDir()'s single-pass RemoveAll runs fails an otherwise-passing test (ga-7dgcg6)", doltRoot, tempRoot)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -12,12 +13,21 @@ import (
 
 // EffectiveMCPForSession loads, expands, and resolves the effective MCP
 // catalog for one concrete session context.
+//
+// topo carries the city's query topology so the {{.WorkQuery}} family this
+// catalog expands names the reader the city actually serves work from. Rendering
+// a single-store `bd ready` into an MCP catalog on a split city tells the agent
+// to run the blind query by hand — the same fail-open the generated work_query
+// closes. Only topo.FederatedReady is read from the caller: the bd semantics
+// still come from cfg, exactly as they did before, so a caller that already
+// passes cfg supplies one fact and not two.
 func EffectiveMCPForSession(
 	cfg *config.City,
 	cityPath string,
 	agent *config.Agent,
 	identity string,
 	workDir string,
+	topo config.QueryTopology,
 ) (MCPCatalog, error) {
 	cfgForMCP := cfg
 	if cfg != nil && cfg.PackMCPDir == "" {
@@ -28,16 +38,19 @@ func EffectiveMCPForSession(
 			cfgForMCP = &clone
 		}
 	}
-	return EffectiveMCPForAgent(cfgForMCP, agent, MCPTemplateData(cfgForMCP, cityPath, agent, identity, workDir))
+	return EffectiveMCPForAgent(cfgForMCP, agent, MCPTemplateData(cfgForMCP, cityPath, agent, identity, workDir, topo))
 }
 
 // MCPTemplateData builds the template expansion surface used by MCP catalogs.
+// topo.Beads is overwritten from cfg when cfg is non-nil; see
+// EffectiveMCPForSession.
 func MCPTemplateData(
 	cfg *config.City,
 	cityPath string,
 	agent *config.Agent,
 	identity string,
 	workDir string,
+	topo config.QueryTopology,
 ) map[string]string {
 	if agent == nil {
 		branch := defaultMCPBranch(workDir)
@@ -53,17 +66,15 @@ func MCPTemplateData(
 	var rigs []config.Rig
 	if cfg != nil {
 		rigs = cfg.Rigs
+		topo.Beads = cfg.Beads
 	}
 	rigName := workdirutil.ConfiguredRigName(cityPath, *agent, rigs)
 	rigRoot := workdirutil.RigRootForName(rigName, rigs)
-	templateName := agent.QualifiedName()
-	if agent.PoolName != "" {
-		templateName = agent.PoolName
-	}
+	templateName := agentutil.RoutedToIdentity(agent)
 	if templateName == "" {
 		templateName = identity
 	}
-	data := make(map[string]string, len(agent.Env)+11)
+	data := make(map[string]string, len(agent.Env)+14)
 	for key, value := range agent.Env {
 		data[key] = value
 	}
@@ -77,7 +88,10 @@ func MCPTemplateData(
 	data["IssuePrefix"] = mcpRigPrefix(rigName, rigs)
 	data["Branch"] = branch
 	data["DefaultBranch"] = branch
-	data["WorkQuery"] = agent.EffectiveWorkQuery()
+	data["WorkQuery"] = agent.EffectiveWorkQueryFor(topo)
+	data["AssignedInProgressQuery"] = agent.EffectiveAssignedInProgressQueryFor(topo)
+	data["AssignedReadyQuery"] = agent.EffectiveAssignedReadyQueryFor(topo)
+	data["RoutedPoolQuery"] = agent.EffectiveRoutedPoolQueryFor(topo)
 	data["SlingQuery"] = agent.EffectiveSlingQuery()
 	return data
 }

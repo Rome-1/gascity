@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -108,7 +109,7 @@ func TestSessionHandleStateBusyDoesNotPrimeHistoryCache(t *testing.T) {
 	workDir := t.TempDir()
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	manager := sessionpkg.NewManager(store, sp)
+	manager := sessionpkg.NewManagerWithOptions(store, sp)
 	handle, err := NewSessionHandle(SessionHandleConfig{
 		Manager:     manager,
 		SearchPaths: []string{searchBase},
@@ -161,6 +162,112 @@ func TestSessionHandleStateBusyDoesNotPrimeHistoryCache(t *testing.T) {
 	}
 	if handle.history != nil {
 		t.Fatal("State() primed history cache, want tail-only busy probe")
+	}
+}
+
+// zcode derives activity from the whole mirror — there is no tail chunk to
+// read — and State is polled per API request, each request building a fresh
+// Factory (so a fresh session.Manager and handle) off the same store. An
+// unchanged mirror must not be re-parsed on every poll: one parse per mirror
+// generation, shared through the memo the long-lived caller threads into
+// every factory it builds.
+func TestSessionHandleStateReusesDerivedActivityAcrossPolls(t *testing.T) {
+	searchBase := t.TempDir()
+	workDir := t.TempDir()
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	memo := NewDerivedActivityMemo()
+	// One Factory per request, the way the API builds them; the memo is the
+	// only thing they share.
+	requestFactory := func() *Factory {
+		t.Helper()
+		factory, err := NewFactory(FactoryConfig{
+			Store:        store,
+			Provider:     sp,
+			SearchPaths:  []string{searchBase},
+			ActivityMemo: memo,
+		})
+		if err != nil {
+			t.Fatalf("NewFactory: %v", err)
+		}
+		return factory
+	}
+	seat, err := requestFactory().Session(SessionSpec{
+		Profile:  ProfileZCodeTmuxCLI,
+		Template: "probe",
+		Title:    "Probe",
+		Command:  "zcode-repl",
+		WorkDir:  workDir,
+		Provider: "zcode",
+	})
+	if err != nil {
+		t.Fatalf("factory.Session: %v", err)
+	}
+	if err := seat.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	info, err := seat.manager.Get(seat.sessionID)
+	if err != nil {
+		t.Fatalf("Get(%q): %v", seat.sessionID, err)
+	}
+
+	scopeDir := filepath.Join(searchBase, sessionlog.ZCodeSeatMirrorScope(info.SessionName, info.ID, "1"))
+	if err := os.MkdirAll(scopeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", scopeDir, err)
+	}
+	mirror := filepath.Join(scopeDir, "sess_probe.json")
+	writeMirror := func(messages string) {
+		t.Helper()
+		body := `{"info":{"id":"sess_probe","directory":"` + filepath.ToSlash(workDir) + `"},"messages":[` + messages + `]}`
+		if err := os.WriteFile(mirror, []byte(body), 0o644); err != nil {
+			t.Fatalf("write mirror: %v", err)
+		}
+	}
+	userTurn := `{"info":{"id":"m1","sessionID":"sess_probe","role":"user","parentID":"","time":{"created":1770000000000}},"parts":[{"id":"p1","type":"text","text":"go"}]}`
+	writeMirror(userTurn)
+
+	// Each poll rebuilds its handle by session id off a fresh factory, as
+	// workerHandleForSession does per request.
+	poll := func(label string) *SessionHandle {
+		t.Helper()
+		handle, err := requestFactory().SessionByID(info.ID)
+		if err != nil {
+			t.Fatalf("SessionByID(%s): %v", label, err)
+		}
+		polled, ok := handle.(*SessionHandle)
+		if !ok {
+			t.Fatalf("SessionByID(%s) = %T, want *SessionHandle", label, handle)
+		}
+		return polled
+	}
+	for i := 1; i <= 3; i++ {
+		state, err := poll(fmt.Sprintf("poll %d", i)).State(context.Background())
+		if err != nil {
+			t.Fatalf("State(poll %d): %v", i, err)
+		}
+		if state.Phase != PhaseBusy {
+			t.Fatalf("State(poll %d).Phase = %s, want %s", i, state.Phase, PhaseBusy)
+		}
+	}
+	if got := memo.Derivations(); got != 1 {
+		t.Fatalf("mirror parsed %d times across 3 polls of an unchanged mirror, want 1", got)
+	}
+
+	// The reply lands: a new generation, parsed once more, and idle.
+	writeMirror(userTurn + `,{"info":{"id":"m2","sessionID":"sess_probe","role":"assistant","parentID":"m1","time":{"created":1770000001000}},"parts":[{"id":"p2","type":"text","text":"done"}]}`)
+	last := poll("after reply")
+	state, err := last.State(context.Background())
+	if err != nil {
+		t.Fatalf("State(after reply): %v", err)
+	}
+	if state.Phase != PhaseReady {
+		t.Fatalf("State(after reply).Phase = %s, want %s", state.Phase, PhaseReady)
+	}
+	if got := memo.Derivations(); got != 2 {
+		t.Fatalf("mirror parsed %d times after one rewrite, want 2", got)
+	}
+	if last.history != nil {
+		t.Fatal("State() primed the polled handle's history cache, want an activity-only probe")
 	}
 }
 
@@ -551,6 +658,22 @@ func TestCanonicalProfileIdentity(t *testing.T) {
 	}
 }
 
+func TestCanonicalProfileIdentityCursor(t *testing.T) {
+	identity, ok := CanonicalProfileIdentity(ProfileCursorTmuxCLI)
+	if !ok {
+		t.Fatal("CanonicalProfileIdentity(ProfileCursorTmuxCLI) = false, want true")
+	}
+	if identity.ProviderFamily != "cursor" {
+		t.Fatalf("ProviderFamily = %q, want cursor", identity.ProviderFamily)
+	}
+	if identity.TransportClass != "tmux-cli" {
+		t.Fatalf("TransportClass = %q, want tmux-cli", identity.TransportClass)
+	}
+	if identity.CertificationFingerprint == "" {
+		t.Fatal("CertificationFingerprint is empty")
+	}
+}
+
 func TestCanonicalProfileIdentityOpenCode(t *testing.T) {
 	identity, ok := CanonicalProfileIdentity(ProfileOpenCodeTmuxCLI)
 	if !ok {
@@ -558,6 +681,22 @@ func TestCanonicalProfileIdentityOpenCode(t *testing.T) {
 	}
 	if identity.ProviderFamily != "opencode" {
 		t.Fatalf("ProviderFamily = %q, want opencode", identity.ProviderFamily)
+	}
+	if identity.TransportClass != "tmux-cli" {
+		t.Fatalf("TransportClass = %q, want tmux-cli", identity.TransportClass)
+	}
+	if identity.CertificationFingerprint == "" {
+		t.Fatal("CertificationFingerprint is empty")
+	}
+}
+
+func TestCanonicalProfileIdentityMimoCode(t *testing.T) {
+	identity, ok := CanonicalProfileIdentity(ProfileMimoCodeTmuxCLI)
+	if !ok {
+		t.Fatal("CanonicalProfileIdentity(ProfileMimoCodeTmuxCLI) = false, want true")
+	}
+	if identity.ProviderFamily != "mimocode" {
+		t.Fatalf("ProviderFamily = %q, want mimocode", identity.ProviderFamily)
 	}
 	if identity.TransportClass != "tmux-cli" {
 		t.Fatalf("TransportClass = %q, want tmux-cli", identity.TransportClass)
@@ -963,7 +1102,7 @@ func TestSessionHandleHistoryLoadsNormalizedTranscript(t *testing.T) {
 	}
 }
 
-func TestSessionHandleHistoryPersistsCodexResumeKeyForLaterRestart(t *testing.T) {
+func TestSessionHandleHistoryDoesNotPersistCodexResumeKeyFromTranscript(t *testing.T) {
 	base := t.TempDir()
 	dayDir := filepath.Join(base, "2026", "04", "14")
 	if err := os.MkdirAll(dayDir, 0o755); err != nil {
@@ -1004,19 +1143,19 @@ func TestSessionHandleHistoryPersistsCodexResumeKeyForLaterRestart(t *testing.T)
 	if err != nil {
 		t.Fatalf("History: %v", err)
 	}
-	if history.GCSessionID != resumeID {
-		t.Fatalf("History().GCSessionID = %q, want %q", history.GCSessionID, resumeID)
+	if history.GCSessionID == resumeID {
+		t.Fatalf("History().GCSessionID = %q, want Gas City session id, not transcript-derived Codex resume id", history.GCSessionID)
 	}
-	if history.LogicalConversationID != resumeID {
-		t.Fatalf("History().LogicalConversationID = %q, want %q", history.LogicalConversationID, resumeID)
+	if history.LogicalConversationID == resumeID {
+		t.Fatalf("History().LogicalConversationID = %q, want non-Codex-derived logical id", history.LogicalConversationID)
 	}
 
 	bead, err := store.Get(handle.sessionID)
 	if err != nil {
 		t.Fatalf("store.Get(%q): %v", handle.sessionID, err)
 	}
-	if bead.Metadata["session_key"] != resumeID {
-		t.Fatalf("session_key = %q, want %q", bead.Metadata["session_key"], resumeID)
+	if got := bead.Metadata["session_key"]; got != "" {
+		t.Fatalf("session_key = %q, want empty; Codex resume keys come from SessionStart hook stdin", got)
 	}
 
 	if err := handle.Stop(context.Background()); err != nil {
@@ -1031,12 +1170,12 @@ func TestSessionHandleHistoryPersistsCodexResumeKeyForLaterRestart(t *testing.T)
 		t.Fatalf("runtime calls = %#v, want second Start", sp.Calls)
 	}
 	wantResume := "codex resume " + resumeID
-	if !strings.Contains(secondStart.Config.Command, wantResume) {
-		t.Fatalf("second start command = %q, want %q", secondStart.Config.Command, wantResume)
+	if strings.Contains(secondStart.Config.Command, wantResume) {
+		t.Fatalf("second start command = %q, must not use transcript-derived Codex resume command %q", secondStart.Config.Command, wantResume)
 	}
 }
 
-func TestSessionHandleStatePersistsCodexResumeKeyWithoutPrimingHistoryCache(t *testing.T) {
+func TestSessionHandleStateDoesNotPersistCodexResumeKeyWithoutPrimingHistoryCache(t *testing.T) {
 	base := t.TempDir()
 	dayDir := filepath.Join(base, "2026", "04", "14")
 	if err := os.MkdirAll(dayDir, 0o755); err != nil {
@@ -1088,8 +1227,8 @@ func TestSessionHandleStatePersistsCodexResumeKeyWithoutPrimingHistoryCache(t *t
 	if err != nil {
 		t.Fatalf("store.Get(%q): %v", handle.sessionID, err)
 	}
-	if bead.Metadata["session_key"] != resumeID {
-		t.Fatalf("session_key = %q, want %q", bead.Metadata["session_key"], resumeID)
+	if got := bead.Metadata["session_key"]; got != "" {
+		t.Fatalf("session_key = %q, want empty; Codex resume keys come from SessionStart hook stdin", got)
 	}
 
 	if err := handle.Stop(context.Background()); err != nil {
@@ -1104,8 +1243,8 @@ func TestSessionHandleStatePersistsCodexResumeKeyWithoutPrimingHistoryCache(t *t
 		t.Fatalf("runtime calls = %#v, want second Start", sp.Calls)
 	}
 	wantResume := "codex resume " + resumeID
-	if !strings.Contains(secondStart.Config.Command, wantResume) {
-		t.Fatalf("second start command = %q, want %q", secondStart.Config.Command, wantResume)
+	if strings.Contains(secondStart.Config.Command, wantResume) {
+		t.Fatalf("second start command = %q, must not use transcript-derived Codex resume command %q", secondStart.Config.Command, wantResume)
 	}
 }
 
@@ -1379,6 +1518,66 @@ func TestRuntimeHandleLiveObservationUsesRuntimeMetadataAndLiveness(t *testing.T
 type falseNegativeRuntimeProvider struct {
 	*runtime.Fake
 	falseNames map[string]bool
+}
+
+type observationErrorRuntimeProvider struct {
+	*runtime.Fake
+	livenessErr error
+	activityErr error
+}
+
+func (p *observationErrorRuntimeProvider) ObserveLivenessWithError(string, []string) (runtime.Liveness, error) {
+	if p.livenessErr != nil {
+		return runtime.Liveness{}, p.livenessErr
+	}
+	return runtime.Liveness{Running: true, Alive: true}, nil
+}
+
+func (p *observationErrorRuntimeProvider) GetLastActivity(string) (time.Time, error) {
+	return time.Time{}, p.activityErr
+}
+
+func TestRuntimeHandleLiveObservationPreservesObservationUncertainty(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		livenessErr error
+		activityErr error
+		wantError   bool
+	}{
+		{name: "liveness unavailable", livenessErr: fmt.Errorf("liveness transport: %w", runtime.ErrRuntimeUnavailable), wantError: true},
+		{name: "activity unavailable", activityErr: fmt.Errorf("activity transport: %w", runtime.ErrRuntimeUnavailable), wantError: true},
+		{name: "ordinary activity error stays best effort", activityErr: errors.New("malformed activity"), wantError: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+				Provider: &observationErrorRuntimeProvider{
+					Fake:        runtime.NewFake(),
+					livenessErr: tc.livenessErr,
+					activityErr: tc.activityErr,
+				},
+				SessionName: "runtime-worker",
+			})
+			if err != nil {
+				t.Fatalf("NewRuntimeHandle: %v", err)
+			}
+			obs, err := handle.LiveObservation(context.Background())
+			if tc.wantError {
+				if !errors.Is(err, runtime.ErrRuntimeUnavailable) {
+					t.Fatalf("LiveObservation error = %v, want runtime unavailable", err)
+				}
+				if obs != (LiveObservation{}) {
+					t.Fatalf("LiveObservation = %#v, want zero with unknown result", obs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LiveObservation: %v", err)
+			}
+			if !obs.Running || !obs.Alive || obs.LastActivity != nil {
+				t.Fatalf("LiveObservation = %#v, want live with unknown activity", obs)
+			}
+		})
+	}
 }
 
 func (p *falseNegativeRuntimeProvider) IsRunning(name string) bool {
@@ -1683,7 +1882,7 @@ func TestRuntimeHandleNudgeWaitIdleUnsupportedProviderReturnsUndelivered(t *test
 func TestSessionCatalogUsesWorkerBoundary(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := sessionpkg.NewManagerWithCityPath(store, sp, t.TempDir())
+	mgr := sessionpkg.NewManagerWithOptions(store, sp, sessionpkg.WithCityPath(t.TempDir()))
 	handle, err := NewSessionHandle(SessionHandleConfig{
 		Manager: mgr,
 		Session: SessionSpec{
@@ -1834,6 +2033,183 @@ func TestSessionHandleHistoryStitchesGeminiRotatedTranscriptAcrossRestart(t *tes
 	}
 }
 
+func TestSessionHandleHistoryRetainsStitchedHistoryAcrossPostRotationRewrite(t *testing.T) {
+	base := t.TempDir()
+	workDir := filepath.Join(base, "workspace")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+
+	searchRoot := filepath.Join(base, ".gemini", "tmp")
+	projectDir := filepath.Join(searchRoot, "project-a")
+	chatsDir := filepath.Join(projectDir, "chats")
+	for _, dir := range []string{searchRoot, projectDir, chatsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, ".project_root"), []byte(workDir), 0o644); err != nil {
+		t.Fatalf("write .project_root: %v", err)
+	}
+
+	firstTranscript := filepath.Join(chatsDir, "session-2026-04-17T03-12-before.json")
+	writeGeminiHistoryFixture(t, firstTranscript, "before-session", []string{
+		`{"id":"u1","timestamp":"2026-04-17T03:12:00Z","type":"user","content":"remember alpha"}`,
+		`{"id":"a1","timestamp":"2026-04-17T03:12:01Z","type":"gemini","content":"remembered alpha"}`,
+	})
+	firstTime := time.Now().Add(-3 * time.Minute)
+	if err := os.Chtimes(firstTranscript, firstTime, firstTime); err != nil {
+		t.Fatalf("chtimes(first transcript): %v", err)
+	}
+
+	handle, _, _, _ := newTestSessionHandle(t, SessionSpec{
+		Profile:  ProfileGeminiTmuxCLI,
+		Template: "probe",
+		Title:    "Probe",
+		Command:  "gemini",
+		WorkDir:  workDir,
+		Provider: "gemini",
+	})
+	handle.adapter.SearchPaths = []string{searchRoot}
+
+	if err := handle.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if _, err := handle.History(context.Background(), HistoryRequest{}); err != nil {
+		t.Fatalf("History(before rotation): %v", err)
+	}
+
+	secondTranscript := filepath.Join(chatsDir, "session-2026-04-17T03-15-after.json")
+	writeGeminiHistoryFixture(t, secondTranscript, "after-session", []string{
+		`{"id":"u2","timestamp":"2026-04-17T03:15:00Z","type":"user","content":"recall the earlier phrase"}`,
+		`{"id":"a2","timestamp":"2026-04-17T03:15:01Z","type":"gemini","content":"alpha"}`,
+	})
+	secondTime := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(secondTranscript, secondTime, secondTime); err != nil {
+		t.Fatalf("chtimes(second transcript): %v", err)
+	}
+
+	stitched, err := handle.History(context.Background(), HistoryRequest{})
+	if err != nil {
+		t.Fatalf("History(after rotation): %v", err)
+	}
+	if got := len(stitched.Entries); got != 4 {
+		t.Fatalf("len(History(after rotation).Entries) = %d, want stitched length 4", got)
+	}
+
+	// A post-rotation turn appends to the SECOND transcript, advancing its
+	// generation (new size + mtime). The retained snapshot reports the second
+	// stream ID but still carries the stitched pre-rotation entries from the
+	// first file, so it must not take the same-stream in-place replacement path
+	// — that path is only for a genuine single-file rewrite. Dropping u1,a1 here
+	// is the post-rotation history-loss regression.
+	writeGeminiHistoryFixture(t, secondTranscript, "after-session", []string{
+		`{"id":"u2","timestamp":"2026-04-17T03:15:00Z","type":"user","content":"recall the earlier phrase"}`,
+		`{"id":"a2","timestamp":"2026-04-17T03:15:01Z","type":"gemini","content":"alpha"}`,
+		`{"id":"a3","timestamp":"2026-04-17T03:16:00Z","type":"gemini","content":"still alpha"}`,
+	})
+	thirdTime := time.Now().Add(-1 * time.Minute)
+	if err := os.Chtimes(secondTranscript, thirdTime, thirdTime); err != nil {
+		t.Fatalf("chtimes(second transcript rewrite): %v", err)
+	}
+
+	after, err := handle.History(context.Background(), HistoryRequest{})
+	if err != nil {
+		t.Fatalf("History(post-rotation generation): %v", err)
+	}
+	if after.TranscriptStreamID != secondTranscript {
+		t.Fatalf("History(post-rotation).TranscriptStreamID = %q, want %q", after.TranscriptStreamID, secondTranscript)
+	}
+	if got := len(after.Entries); got != 5 {
+		t.Fatalf("len(History(post-rotation).Entries) = %d, want 5 with pre-rotation history preserved", got)
+	}
+	if after.Entries[0].Text != "remember alpha" || after.Entries[1].Text != "remembered alpha" {
+		t.Fatalf("History(post-rotation).Entries[:2] = %+v, want preserved pre-rotation history", after.Entries[:2])
+	}
+	if after.Entries[2].Text != "recall the earlier phrase" || after.Entries[3].Text != "alpha" {
+		t.Fatalf("History(post-rotation).Entries[2:4] = %+v, want resumed transcript tail", after.Entries[2:4])
+	}
+	if after.Entries[4].Text != "still alpha" {
+		t.Fatalf("History(post-rotation).Entries[4].Text = %q, want appended post-rotation turn", after.Entries[4].Text)
+	}
+}
+
+func TestSessionHandleHistoryTreatsSameGeminiTranscriptRewriteAsReplacement(t *testing.T) {
+	base := t.TempDir()
+	workDir := filepath.Join(base, "workspace")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+
+	searchRoot := filepath.Join(base, ".gemini", "tmp")
+	projectDir := filepath.Join(searchRoot, "project-a")
+	chatsDir := filepath.Join(projectDir, "chats")
+	if err := os.MkdirAll(chatsDir, 0o755); err != nil {
+		t.Fatalf("mkdir chatsDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, ".project_root"), []byte(workDir), 0o644); err != nil {
+		t.Fatalf("write .project_root: %v", err)
+	}
+
+	transcriptPath := filepath.Join(chatsDir, "session-2026-04-17T03-12.json")
+	writeGeminiHistoryFixture(t, transcriptPath, "provider-conversation", []string{
+		`{"id":"a","timestamp":"2026-04-17T03:12:00Z","type":"user","content":"cached a"}`,
+		`{"id":"b","timestamp":"2026-04-17T03:12:01Z","type":"gemini","content":"cached b"}`,
+	})
+	firstTime := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(transcriptPath, firstTime, firstTime); err != nil {
+		t.Fatalf("chtimes(initial transcript): %v", err)
+	}
+
+	handle, _, _, _ := newTestSessionHandle(t, SessionSpec{
+		Profile:  ProfileGeminiTmuxCLI,
+		Template: "probe",
+		Title:    "Probe",
+		Command:  "gemini",
+		WorkDir:  workDir,
+		Provider: "gemini",
+	})
+	handle.adapter.SearchPaths = []string{searchRoot}
+	if err := handle.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	before, err := handle.History(context.Background(), HistoryRequest{})
+	if err != nil {
+		t.Fatalf("History(before rewrite): %v", err)
+	}
+	if got := historyEntryIDs(before); !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Fatalf("History(before rewrite) IDs = %v, want [a b]", got)
+	}
+
+	writeGeminiHistoryFixture(t, transcriptPath, "provider-conversation", []string{
+		`{"id":"x","timestamp":"2026-04-17T03:15:00Z","type":"user","content":"replacement x"}`,
+		`{"id":"y","timestamp":"2026-04-17T03:15:01Z","type":"gemini","content":"replacement y"}`,
+	})
+	secondTime := firstTime.Add(time.Minute)
+	if err := os.Chtimes(transcriptPath, secondTime, secondTime); err != nil {
+		t.Fatalf("chtimes(rewritten transcript): %v", err)
+	}
+
+	after, err := handle.History(context.Background(), HistoryRequest{})
+	if err != nil {
+		t.Fatalf("History(after rewrite): %v", err)
+	}
+	if after.TranscriptStreamID != before.TranscriptStreamID {
+		t.Fatalf("TranscriptStreamID changed across same-path rewrite: before %q after %q", before.TranscriptStreamID, after.TranscriptStreamID)
+	}
+	if after.LogicalConversationID != before.LogicalConversationID {
+		t.Fatalf("LogicalConversationID changed across rewrite: before %q after %q", before.LogicalConversationID, after.LogicalConversationID)
+	}
+	if after.Generation.ID == before.Generation.ID {
+		t.Fatalf("Generation.ID = %q before and after rewrite, want changed generation", after.Generation.ID)
+	}
+	if got := historyEntryIDs(after); !reflect.DeepEqual(got, []string{"x", "y"}) {
+		t.Fatalf("History(after rewrite) IDs = %v, want authoritative replacement [x y]", got)
+	}
+}
+
 func TestSessionHandleStartPassesSessionEnv(t *testing.T) {
 	handle, _, sp, _ := newTestSessionHandle(t, SessionSpec{
 		Profile:  ProfileGeminiTmuxCLI,
@@ -1949,23 +2325,14 @@ func TestSessionHandleStartUsesSessionIDOnFirstStartAndResumeAfterSuspend(t *tes
 func TestSessionHandleStartUsesCurrentResumeOverridesAfterSuspend(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	manager := sessionpkg.NewManager(store, sp)
+	manager := sessionpkg.NewManagerWithOptions(store, sp)
 
-	info, err := manager.Create(
-		context.Background(),
-		"probe",
-		"Probe",
-		"legacy-agent",
-		t.TempDir(),
-		"legacy-agent",
-		nil,
-		sessionpkg.ProviderResume{
+	info, err := manager.CreateSession(
+		context.Background(), sessionpkg.CreateOptions{Template: "probe", Title: "Probe", Command: "legacy-agent", WorkDir: t.TempDir(), Provider: "legacy-agent", Env: nil, Resume: sessionpkg.ProviderResume{
 			ResumeFlag:    "--old-resume",
 			ResumeStyle:   "flag",
 			SessionIDFlag: "--session-id",
-		},
-		runtime.Config{},
-	)
+		}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -2031,7 +2398,7 @@ func newTestSessionHandleWithRecorder(t *testing.T, spec SessionSpec, recorder e
 
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	manager := sessionpkg.NewManager(store, sp)
+	manager := sessionpkg.NewManagerWithOptions(store, sp)
 	handle, err := NewSessionHandle(SessionHandleConfig{
 		Manager:  manager,
 		Recorder: recorder,

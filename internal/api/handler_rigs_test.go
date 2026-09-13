@@ -149,12 +149,15 @@ func TestRigEnrichmentUsesProcessNamesForRuntimeFalseNegative(t *testing.T) {
 	}
 }
 
-func TestRigEnrichmentUsesProviderlessDetectedProcessNames(t *testing.T) {
+func TestRigEnrichmentUsesExplicitProviderDetectedProcessNames(t *testing.T) {
 	putExecutableOnPath(t, "codex")
 	base := newFakeState(t)
 	base.cfg.Workspace.Provider = ""
+	base.cfg.Providers = map[string]config.ProviderSpec{
+		"codex": config.BuiltinProviderAlias("codex"),
+	}
 	base.cfg.Agents = []config.Agent{
-		{Name: "worker", Dir: "myrig", MaxActiveSessions: intPtr(1)},
+		{Name: "worker", Dir: "myrig", Provider: "codex", MaxActiveSessions: intPtr(1)},
 	}
 	sp := &falseNegativeSessionProvider{Fake: runtime.NewFake()}
 	if err := sp.Start(context.Background(), "myrig--worker", runtime.Config{ProcessNames: []string{"codex"}}); err != nil {
@@ -244,7 +247,24 @@ func TestRigActionUnknown(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/rig/myrig/reboot"), nil))
 
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
+	// RigActionInput.Action carries an enum:"suspend,resume,restart" schema, so
+	// Huma rejects an unknown action at request validation with the typed
+	// validation-failed contract (mirroring the agent-action surface) rather than
+	// the pre-conversion legacy bare-404 body with empty code/type.
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body: %s", rec.Code, rec.Body.String())
+	}
+	var pd struct {
+		Type string `json:"type"`
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&pd); err != nil {
+		t.Fatalf("decode 422 body: %v", err)
+	}
+	if pd.Code != "validation-failed" {
+		t.Errorf("code = %q, want validation-failed", pd.Code)
+	}
+	if pd.Type != "urn:gascity:error:validation-failed" {
+		t.Errorf("type = %q, want urn:gascity:error:validation-failed", pd.Type)
 	}
 }

@@ -171,6 +171,150 @@ func TestApplyPatches_AgentScalars(t *testing.T) {
 	}
 }
 
+func TestApplyPatches_AgentRigWildcard(t *testing.T) {
+	cfg := &City{Agents: []Agent{
+		{Name: "polecat", Provider: "old-city", Env: map[string]string{"KEEP": "1"}},
+		{Name: "polecat", Dir: "rig-a", Provider: "old-a"},
+		{Name: "polecat", Dir: "rig-b", Provider: "old-b", OptionDefaults: map[string]string{"old": "x"}},
+		{Name: "polecat", Dir: "rig-c", Provider: "old-c"},
+		{Name: "other", Dir: "rig-c", Provider: "stay"},
+	}}
+	err := ApplyPatches(cfg, Patches{Agents: []AgentPatch{{
+		Name:           "polecat",
+		Rig:            "*",
+		Provider:       ptrStr("llama"),
+		Env:            map[string]string{"PATCHED": "yes"},
+		OptionDefaults: map[string]string{"model": "sonnet"},
+	}}})
+	if err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	matched := 0
+	for _, a := range cfg.Agents {
+		if a.Name != "polecat" {
+			if a.Provider != "stay" {
+				t.Fatalf("non-target provider = %q, want stay", a.Provider)
+			}
+			continue
+		}
+		matched++
+		if a.Provider != "llama" {
+			t.Fatalf("provider = %q, want llama", a.Provider)
+		}
+		if a.Env["PATCHED"] != "yes" {
+			t.Fatalf("Env[PATCHED] = %q, want yes", a.Env["PATCHED"])
+		}
+		if a.OptionDefaults["model"] != "sonnet" {
+			t.Fatalf("OptionDefaults[model] = %q, want sonnet", a.OptionDefaults["model"])
+		}
+	}
+	if matched != 4 {
+		t.Fatalf("matched agents = %d, want 4", matched)
+	}
+}
+
+func TestApplyPatches_AgentRigWildcardNoMatch(t *testing.T) {
+	cfg := &City{Agents: []Agent{{Name: "mayor"}}}
+	err := ApplyPatches(cfg, Patches{Agents: []AgentPatch{{Name: "polecat", Rig: "*", Suspended: ptrBool(true)}}})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "*/polecat") || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("error = %q, want wildcard not found", err)
+	}
+}
+
+func TestApplyPatches_AgentRigSpecificNewSyntax(t *testing.T) {
+	cfg := &City{Agents: []Agent{{Name: "polecat"}, {Name: "polecat", Dir: "rigA"}, {Name: "polecat", Dir: "rigB"}}}
+	err := ApplyPatches(cfg, Patches{Agents: []AgentPatch{{Name: "polecat", Rig: "rigA", Suspended: ptrBool(true)}}})
+	if err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	if cfg.Agents[1].Suspended != true {
+		t.Fatal("rigA agent not patched")
+	}
+	if cfg.Agents[0].Suspended || cfg.Agents[2].Suspended {
+		t.Fatal("non-rigA agents should stay unchanged")
+	}
+}
+
+func TestApplyPatches_AgentRigLegacyDirStillWorks(t *testing.T) {
+	cfg := &City{Agents: []Agent{{Name: "polecat", Dir: "rigA"}, {Name: "polecat", Dir: "rigB"}}}
+	err := ApplyPatches(cfg, Patches{Agents: []AgentPatch{{Name: "polecat", Dir: "rigA", Provider: ptrStr("llama")}}})
+	if err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	if cfg.Agents[0].Provider != "llama" {
+		t.Fatalf("rigA provider = %q, want llama", cfg.Agents[0].Provider)
+	}
+	if cfg.Agents[1].Provider == "llama" {
+		t.Fatal("rigB should stay unchanged")
+	}
+}
+
+func TestApplyPatches_AgentRigAndDirConflict(t *testing.T) {
+	cfg := &City{Agents: []Agent{{Name: "polecat", Dir: "rigA"}}}
+	err := ApplyPatches(cfg, Patches{Agents: []AgentPatch{{Name: "polecat", Dir: "rigA", Rig: "rigB"}}})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "use only one of dir or rig") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+// TestAgentPatch_Validate covers the write-boundary identity guard that the
+// HTTP patch API and the config editor both call before persisting a patch:
+// Name is required, and the legacy Dir key and the newer Rig key (including the
+// "*" wildcard) are mutually exclusive. A dir+rig patch would hard-fail the
+// next config load, so it must be rejected fail-fast rather than written.
+func TestAgentPatch_Validate(t *testing.T) {
+	tests := []struct {
+		name    string
+		patch   AgentPatch
+		wantErr string // substring; empty means Validate must return nil
+	}{
+		{name: "name only (city scope)", patch: AgentPatch{Name: "worker"}},
+		{name: "dir only (legacy rig key)", patch: AgentPatch{Dir: "rigA", Name: "worker"}},
+		{name: "rig only (new key)", patch: AgentPatch{Rig: "rigA", Name: "worker"}},
+		{name: "wildcard only", patch: AgentPatch{Rig: "*", Name: "worker"}},
+		{name: "missing name", patch: AgentPatch{Dir: "rigA"}, wantErr: "name is required"},
+		{name: "dir and rig", patch: AgentPatch{Dir: "rigA", Rig: "rigB", Name: "worker"}, wantErr: "use only one of dir or rig"},
+		{name: "dir and wildcard rig", patch: AgentPatch{Dir: "rigA", Rig: "*", Name: "worker"}, wantErr: "use only one of dir or rig"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.patch.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() = nil, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() = %q, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestApplyPatches_AgentCityScopedUnchanged(t *testing.T) {
+	cfg := &City{Agents: []Agent{{Name: "polecat"}, {Name: "polecat", Dir: "rigA"}}}
+	err := ApplyPatches(cfg, Patches{Agents: []AgentPatch{{Name: "polecat", Suspended: ptrBool(true)}}})
+	if err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	if !cfg.Agents[0].Suspended {
+		t.Fatal("city-scoped agent should match")
+	}
+	if cfg.Agents[1].Suspended {
+		t.Fatal("rig-scoped agent should not match city-scoped patch")
+	}
+}
+
 func TestApplyPatches_AgentInjectFragmentsPresenceAware(t *testing.T) {
 	t.Run("nil pointer leaves baseline unchanged", func(t *testing.T) {
 		cfg := &City{
@@ -697,6 +841,111 @@ func TestPatchesIsEmpty(t *testing.T) {
 	}
 	if (&Patches{Agents: []AgentPatch{{Name: "x"}}}).IsEmpty() {
 		t.Error("Patches with agents should not be empty")
+	}
+	if (&Patches{NamedSessions: []NamedSessionPatch{{Template: "mayor"}}}).IsEmpty() {
+		t.Error("Patches with named sessions should not be empty")
+	}
+}
+
+func TestLoadWithIncludes_PatchesNamedSession(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+[workspace]
+name = "test"
+
+[[agent]]
+name = "mayor"
+
+[[named_session]]
+template = "mayor"
+mode = "on_demand"
+
+[[patches.named_session]]
+template = "mayor"
+mode = "always"
+`)
+	cfg, _, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	sessions := userNamedSessions(cfg.NamedSessions)
+	if len(sessions) != 1 {
+		t.Fatalf("len(user NamedSessions) = %d, want 1", len(sessions))
+	}
+	if got := sessions[0].Template; got != "mayor" {
+		t.Errorf("Template = %q, want mayor", got)
+	}
+	if got := sessions[0].Mode; got != "always" {
+		t.Errorf("Mode = %q, want always", got)
+	}
+}
+
+func TestLoadWithIncludes_PatchesNamedSessionByNameWhenTemplateAmbiguous(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+[workspace]
+name = "test"
+
+[[agent]]
+name = "coder"
+max_active_sessions = 2
+
+[[named_session]]
+name = "alice"
+template = "coder"
+mode = "on_demand"
+
+[[named_session]]
+name = "bob"
+template = "coder"
+mode = "on_demand"
+
+[[patches.named_session]]
+name = "bob"
+mode = "always"
+`)
+	cfg, _, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	if got := cfg.NamedSessions[0].Mode; got != "on_demand" {
+		t.Fatalf("alice mode = %q, want on_demand", got)
+	}
+	if got := cfg.NamedSessions[1].Mode; got != "always" {
+		t.Fatalf("bob mode = %q, want always", got)
+	}
+}
+
+func TestLoadWithIncludes_PatchNamedSessionTemplateAmbiguous(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+[workspace]
+name = "test"
+
+[[agent]]
+name = "coder"
+max_active_sessions = 2
+
+[[named_session]]
+name = "alice"
+template = "coder"
+mode = "on_demand"
+
+[[named_session]]
+name = "bob"
+template = "coder"
+mode = "on_demand"
+
+[[patches.named_session]]
+template = "coder"
+mode = "always"
+`)
+	_, _, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err == nil {
+		t.Fatal("expected ambiguous named_session patch error")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "coder") {
+		t.Fatalf("error = %q, want ambiguous coder target", err)
 	}
 }
 

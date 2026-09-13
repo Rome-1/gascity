@@ -12,8 +12,8 @@ import (
 
 func TestRunDoltCleanup_HumanOutputShowsAllWireframeSections(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
 	fs.Files["/city/.beads/metadata.json"] = []byte(`{"dolt_database":"hq"}`)
+	putCanonicalCityConfig(fs)
 	putFakeDirTree(fs, "/city/.beads/dolt/.dolt_dropped_databases", map[string]int64{
 		"db_old/data": 4096,
 	})
@@ -30,6 +30,8 @@ func TestRunDoltCleanup_HumanOutputShowsAllWireframeSections(t *testing.T) {
 	opts := cleanupOptions{
 		Rigs:              rigs,
 		FS:                fs,
+		CityPath:          "/city",
+		LiveResolve:       fakeLiveResolve(),
 		JSON:              false, // human mode
 		DoltClient:        client,
 		HomeDir:           "/home/u",
@@ -207,6 +209,39 @@ func TestRunDoltCleanup_HumanOutputCountsPostSIGTERMGoneAsReaped(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, "Reaped:        1") {
 		t.Errorf("human output did not count post-SIGTERM disappearance as reaped:\n%s", out)
+	}
+}
+
+func TestRunDoltCleanup_HumanOutputShowsDeletedScopeReapReason(t *testing.T) {
+	// A bare deleted-cwd server has no --config; the orphan line must still
+	// tell the operator why it is being reaped (ga-10wmzh).
+	procs := []DoltProcInfo{{
+		PID:      6123,
+		Argv:     []string{"dolt", "sql-server", "-H", "127.0.0.1", "-P", "33411"},
+		CWDState: procPathStateDeleted,
+	}}
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		FS:                fsys.NewFake(),
+		JSON:              false,
+		HomeDir:           "/home/u",
+		DiscoverProcesses: func() ([]DoltProcInfo, error) { return procs, nil },
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"ORPHAN dolt sql-server PROCESSES (1)",
+		"6123",
+		"(no --config flag)",
+		"deleted",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("human output missing %q\n--- output ---\n%s", want, out)
+		}
 	}
 }
 

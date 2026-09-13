@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ type restartRequestTestEnv struct {
 	desiredState map[string]TemplateParams
 	stdout       bytes.Buffer
 	stderr       bytes.Buffer
+	startOptions []startExecutionOption
 }
 
 func newRestartRequestTestEnv() *restartRequestTestEnv {
@@ -37,6 +39,10 @@ func newRestartRequestTestEnv() *restartRequestTestEnv {
 		rec:          events.Discard,
 		cfg:          &config.City{},
 		desiredState: make(map[string]TemplateParams),
+		startOptions: []startExecutionOption{
+			withStartStabilityWaiter(immediateStartStabilityWaiter),
+			withSessionStaleKeyDetectionWaiter(immediateSessionStaleKeyDetectionWaiter),
+		},
 	}
 }
 
@@ -74,6 +80,10 @@ func (e *restartRequestTestEnv) reconcile(sessions []beads.Bead) {
 			poolDesired[tp.TemplateName]++
 		}
 	}
+	e.reconcileWithPoolDesiredAndDrainOps(sessions, poolDesired, nil)
+}
+
+func (e *restartRequestTestEnv) reconcileWithPoolDesiredAndDrainOps(sessions []beads.Bead, poolDesired map[string]int, dops drainOps) {
 	cfgNames := configuredSessionNames(e.cfg, "", e.store)
 	_ = reconcileSessionBeads(
 		context.Background(),
@@ -83,7 +93,7 @@ func (e *restartRequestTestEnv) reconcile(sessions []beads.Bead) {
 		e.cfg,
 		e.sp,
 		e.store,
-		nil,
+		dops,
 		nil,
 		nil,
 		e.dt,
@@ -98,7 +108,58 @@ func (e *restartRequestTestEnv) reconcile(sessions []beads.Bead) {
 		0,
 		&e.stdout,
 		&e.stderr,
+		e.startOptions...,
 	)
+}
+
+type clearRestartErrorDrainOps struct {
+	*fakeDrainOps
+	err error
+}
+
+func (d *clearRestartErrorDrainOps) clearRestartRequested(string) error {
+	return d.err
+}
+
+func newLiveRestartRequestScenario(t *testing.T) (*restartRequestTestEnv, beads.Bead, string) {
+	t.Helper()
+
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "worker",
+		ResolvedProvider: &config.ResolvedProvider{
+			SessionIDFlag: "--session-id",
+		},
+	}
+
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "on_demand",
+		"state":                      "active",
+		"session_key":                "original-key",
+		"started_config_hash":        "hash-before-restart",
+	})
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_RESTART_REQUESTED", "1"); err != nil {
+		t.Fatalf("SetMeta(GC_RESTART_REQUESTED): %v", err)
+	}
+
+	return env, session, sessionName
 }
 
 func TestReconcileSessionBeads_RestartRequestRotatesKeyForSessionIDProviders(t *testing.T) {
@@ -247,6 +308,38 @@ func TestReconcileSessionBeads_RestartRequestPreservesLiveHashesDuringHandoff(t 
 	}
 }
 
+func TestReconcileSessionBeads_RestartRequestReportsClearRestartRequestedError(t *testing.T) {
+	env, session, sessionName := newLiveRestartRequestScenario(t)
+	env.sp.RemoveMetaErrors[sessionName] = map[string]error{
+		"GC_RESTART_REQUESTED": errors.New("permission denied"),
+	}
+
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, map[string]int{"worker": 0}, newDrainOps(env.sp))
+
+	got := env.stderr.String()
+	if !strings.Contains(got, "clearing restart-requested marker") ||
+		!strings.Contains(got, sessionName) ||
+		!strings.Contains(got, session.ID) ||
+		!strings.Contains(got, "permission denied") {
+		t.Fatalf("stderr = %q, want contextual clearRestartRequested diagnostic", got)
+	}
+}
+
+func TestReconcileSessionBeads_RestartRequestSuppressesGoneClearRestartRequestedError(t *testing.T) {
+	env, session, sessionName := newLiveRestartRequestScenario(t)
+	dops := &clearRestartErrorDrainOps{
+		fakeDrainOps: newFakeDrainOps(),
+		err:          fmt.Errorf("%w: %s", runtime.ErrSessionNotFound, sessionName),
+	}
+	dops.restartRequested[sessionName] = true
+
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, map[string]int{"worker": 0}, dops)
+
+	if got := env.stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want no diagnostic for gone clearRestartRequested error", got)
+	}
+}
+
 func TestReconcileSessionBeads_RestartRequestPreservesIntentWhenKillFails(t *testing.T) {
 	env := newRestartRequestTestEnv()
 	env.cfg = &config.City{
@@ -349,7 +442,7 @@ func TestReconcileSessionBeads_RestartRequestClearsCircuitBreakerForNextWake(t *
 		"session_key":                "original-key",
 		"started_config_hash":        "hash-before-restart",
 	})
-	if err := persistSessionCircuitBreakerMetadata(env.store, &session, cb, identity, base); err != nil {
+	if err := persistSessionCircuitBreakerMetadata(sessionFrontDoor(env.store), session.ID, cb, identity, base); err != nil {
 		t.Fatalf("persist circuit metadata: %v", err)
 	}
 	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
@@ -573,3 +666,204 @@ func TestReconcileSessionBeads_RestartRequestNamedAlwaysWakesSameTick(t *testing
 }
 
 func restartRequestTestIntPtr(n int) *int { return &n }
+
+func TestReconcileSessionBeads_RestartRequestSkipsCollateralKillForPinnedNamedSession(t *testing.T) {
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "worker",
+		ResolvedProvider: &config.ResolvedProvider{
+			SessionIDFlag: "--session-id",
+		},
+	}
+
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+		"state":                      "active",
+		"pin_awake":                  "true",
+		"restart_requested":          "true",
+		"session_key":                "original-key",
+		"started_config_hash":        "hash-before-restart",
+	})
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	env.reconcile([]beads.Bead{session})
+
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("pinned named session %q was killed by collateral restart request", sessionName)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if got.Metadata["restart_requested"] != "" {
+		t.Fatalf("restart_requested = %q, want cleared after deferring collateral kill", got.Metadata["restart_requested"])
+	}
+	if got.Metadata["session_key"] != "original-key" {
+		t.Fatalf("session_key = %q, want preserved", got.Metadata["session_key"])
+	}
+	if got.Metadata["started_config_hash"] != "hash-before-restart" {
+		t.Fatalf("started_config_hash = %q, want preserved", got.Metadata["started_config_hash"])
+	}
+	if got.Metadata["continuation_reset_pending"] != "" {
+		t.Fatalf("continuation_reset_pending = %q, want untouched", got.Metadata["continuation_reset_pending"])
+	}
+	if got := env.stderr.String(); !strings.Contains(got, "skipping abrupt restart-requested kill for pinned named session") {
+		t.Fatalf("stderr = %q, want pinned restart deferral diagnostic", got)
+	}
+}
+
+func TestReconcileSessionBeads_RestartRequestAllowsExplicitResetForPinnedNamedSession(t *testing.T) {
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "worker",
+		ResolvedProvider: &config.ResolvedProvider{
+			SessionIDFlag: "--session-id",
+		},
+	}
+
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "on_demand",
+		"state":                      "active",
+		"pin_awake":                  "true",
+		"restart_requested":          "true",
+		"continuation_reset_pending": "true",
+		"session_key":                "original-key",
+		"started_config_hash":        "hash-before-restart",
+	})
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	env.reconcile([]beads.Bead{session})
+
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("explicit reset should still stop pinned named session %q", sessionName)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if got.Metadata["restart_requested"] != "" {
+		t.Fatalf("restart_requested = %q, want cleared after explicit reset", got.Metadata["restart_requested"])
+	}
+	if got.Metadata["session_key"] == "" || got.Metadata["session_key"] == "original-key" {
+		t.Fatalf("session_key = %q, want rotated after explicit reset", got.Metadata["session_key"])
+	}
+	if got.Metadata["continuation_reset_pending"] != "true" {
+		t.Fatalf("continuation_reset_pending = %q, want true until next start", got.Metadata["continuation_reset_pending"])
+	}
+}
+
+// TestDoHandoff_PinnedAlwaysSessionPersistsResetAndReconcilerStopsSession
+// covers Fix 1 end-to-end: doHandoffWithOutcome on a pinned always-mode
+// session with a working persistRestart must land continuation_reset_pending
+// on the session bead, and that persisted state must be exactly what lets the
+// reconciler's explicit-reset escape hatch actually stop the pinned session
+// on its next pass (mirrors
+// TestReconcileSessionBeads_RestartRequestAllowsExplicitResetForPinnedNamedSession,
+// but drives the persisted state through the CLI instead of setting it
+// directly).
+func TestDoHandoff_PinnedAlwaysSessionPersistsResetAndReconcilerStopsSession(t *testing.T) {
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "mayor", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "mayor", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "mayor")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "mayor",
+		ResolvedProvider: &config.ResolvedProvider{
+			SessionIDFlag: "--session-id",
+		},
+	}
+
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "mayor",
+		namedSessionModeMetadata:     "always",
+		"state":                      "active",
+		"pin_awake":                  "true",
+	})
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	dops := newDrainOps(env.sp)
+	persistCalled := false
+	persistRestart := func() error {
+		persistCalled = true
+		// Stands in for Manager.RequestFreshRestart (out of scope here):
+		// what doHandoffWithOutcome actually depends on is that a working
+		// persistRestart lands continuation_reset_pending on the bead.
+		return env.store.SetMetadata(session.ID, "continuation_reset_pending", "true")
+	}
+
+	var stdout, stderr bytes.Buffer
+	outcome := doHandoffWithOutcome(env.store, env.store, env.rec, dops, persistRestart,
+		sessionName, sessionName, []string{"HANDOFF: context full"}, &stdout, &stderr)
+	if outcome.code != 0 {
+		t.Fatalf("code = %d, want 0; stderr: %s", outcome.code, stderr.String())
+	}
+	if !outcome.restartRequested {
+		t.Fatal("restartRequested = false, want true for pinned always-mode session with working persistRestart")
+	}
+	if !persistCalled {
+		t.Fatal("persistRestart was not called for pinned always-mode session")
+	}
+	if !strings.Contains(stdout.String(), "requesting restart") {
+		t.Errorf("stdout = %q, want restart-requested confirmation", stdout.String())
+	}
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if got.Metadata["continuation_reset_pending"] != "true" {
+		t.Fatalf("continuation_reset_pending = %q, want true after successful pinned handoff", got.Metadata["continuation_reset_pending"])
+	}
+
+	// The reconciler is the end-to-end oracle: with continuation_reset_pending
+	// now landed, its explicit-reset escape hatch must actually stop the
+	// pinned session on the next reconcile pass.
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{got}, map[string]int{"mayor": 1}, dops)
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("pinned session %q still running after reconcile; persisted restart should have let the reconciler stop it", sessionName)
+	}
+}

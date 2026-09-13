@@ -141,6 +141,21 @@ type StoreMaintenanceLoopDeps struct {
 	// set. Nil disables alerts; tests that do not exercise the alert
 	// path can leave it unset.
 	Mail mail.Provider
+
+	// DiskFreeBytes probes the free bytes available in path's filesystem.
+	// Nil disables the disk pre-flight for this loop. Production wires
+	// this to the OS statvfs call; tests supply a fake reader.
+	DiskFreeBytes func(path string) (int64, error)
+
+	// DiskMinFreeBytes is the critical floor. When free space falls below
+	// this threshold CALL DOLT_GC is skipped and StoreDiskCritical is
+	// emitted. Zero disables the check entirely.
+	DiskMinFreeBytes int64
+
+	// DiskWarnFreeBytes is the soft floor. When free space falls below this
+	// threshold (but is still above DiskMinFreeBytes) StoreDiskWarn is
+	// emitted and the GC proceeds.
+	DiskWarnFreeBytes int64
 }
 
 // StoreMaintenanceLoop runs periodic Dolt store maintenance inside the
@@ -150,16 +165,19 @@ type StoreMaintenanceLoopDeps struct {
 //
 // The zero value is not usable — construct with NewStoreMaintenanceLoop.
 type StoreMaintenanceLoop struct {
-	cfg            config.DoltMaintenance
-	store          beads.Store
-	cityPath       string
-	recorder       events.Recorder
-	stderr         io.Writer
-	clock          func() time.Time
-	rand           func() float64
-	openDoltOps    DoltOpsFactory
-	openDoltBackup DoltBackupRunnerFactory
-	mail           mail.Provider
+	cfg               config.DoltMaintenance
+	store             beads.Store
+	cityPath          string
+	recorder          events.Recorder
+	stderr            io.Writer
+	clock             func() time.Time
+	rand              func() float64
+	openDoltOps       DoltOpsFactory
+	openDoltBackup    DoltBackupRunnerFactory
+	mail              mail.Provider
+	diskFreeBytes     func(path string) (int64, error)
+	diskMinFreeBytes  int64
+	diskWarnFreeBytes int64
 
 	// mu is the in-process maintenance lease. runOnce and TriggerNow hold
 	// it for the duration of a single maintenance cycle; each contends on
@@ -216,18 +234,21 @@ func NewStoreMaintenanceLoop(deps StoreMaintenanceLoopDeps) *StoreMaintenanceLoo
 		deps.Stderr = io.Discard
 	}
 	return &StoreMaintenanceLoop{
-		cfg:            deps.Cfg,
-		store:          deps.Store,
-		cityPath:       deps.CityPath,
-		recorder:       deps.Recorder,
-		stderr:         deps.Stderr,
-		clock:          deps.Clock,
-		rand:           deps.Rand,
-		openDoltOps:    deps.OpenDoltOps,
-		openDoltBackup: deps.OpenDoltBackup,
-		mail:           deps.Mail,
-		lastRunAt:      deps.LastRunAt,
-		history:        make([]MaintenanceRun, 0, maintenanceHistorySize),
+		cfg:               deps.Cfg,
+		store:             deps.Store,
+		cityPath:          deps.CityPath,
+		recorder:          deps.Recorder,
+		stderr:            deps.Stderr,
+		clock:             deps.Clock,
+		rand:              deps.Rand,
+		openDoltOps:       deps.OpenDoltOps,
+		openDoltBackup:    deps.OpenDoltBackup,
+		mail:              deps.Mail,
+		diskFreeBytes:     deps.DiskFreeBytes,
+		diskMinFreeBytes:  deps.DiskMinFreeBytes,
+		diskWarnFreeBytes: deps.DiskWarnFreeBytes,
+		lastRunAt:         deps.LastRunAt,
+		history:           make([]MaintenanceRun, 0, maintenanceHistorySize),
 	}
 }
 
@@ -376,6 +397,17 @@ func (m *StoreMaintenanceLoop) executeCycleLocked(ctx context.Context) Maintenan
 	m.runStartedAt.Store(&started)
 	defer m.runStartedAt.Store(nil)
 
+	if m.checkDiskPreflight() {
+		// Disk is critically low — skip both the snapshot and CALL DOLT_GC.
+		// Snapshotting the store needs roughly as much free space as the
+		// store itself, so a critically-low store would fail the backup and
+		// still leave no room for GC. Running the pre-flight before the
+		// snapshot means a CRITICAL disk skips both stages rather than
+		// attempting a doomed backup that only consumes the last of the disk.
+		// The StoreDiskCritical event informs operators; C1
+		// (hold-on-store-unreachable) handles downstream safety.
+		return m.finishCycleLocked(started, "", nil)
+	}
 	snapshotPath, err := m.runSnapshot(ctx)
 	if err != nil {
 		return m.finishCycleLocked(started, snapshotPath, err)
@@ -455,6 +487,75 @@ func (m *StoreMaintenanceLoop) emitRunEvent(run MaintenanceRun) {
 	if run.Err != "" {
 		m.sendFailureAlert(run)
 	}
+}
+
+// checkDiskPreflight checks free space in cityPath's filesystem before the
+// disk-growing stages of a maintenance cycle (snapshot, then CALL DOLT_GC).
+// Returns true when both stages should be skipped (CRITICAL), false when the
+// cycle may proceed. Side-effects: emits
+// StoreDiskWarn or StoreDiskCritical events and logs to stderr.
+// Fails open: a probe error or a nil DiskFreeBytes always returns false.
+func (m *StoreMaintenanceLoop) checkDiskPreflight() bool {
+	if m.diskFreeBytes == nil || m.diskMinFreeBytes == 0 {
+		return false
+	}
+	free, err := m.diskFreeBytes(m.cityPath)
+	if err != nil {
+		fmt.Fprintf(m.stderr, "store-maintenance: disk pre-flight probe failed (fail-open): %v\n", err) //nolint:errcheck
+		return false
+	}
+	const gib = float64(1 << 30)
+	if free < m.diskMinFreeBytes {
+		m.emitDiskEvent(events.StoreDiskCritical, free)
+		fmt.Fprintf(m.stderr, //nolint:errcheck
+			"store-maintenance: disk CRITICAL — %.1f GiB free (floor %.1f GiB) on %s; skipping snapshot and CALL DOLT_GC\n",
+			float64(free)/gib, float64(m.diskMinFreeBytes)/gib, m.cityPath)
+		return true
+	}
+	if m.diskWarnFreeBytes > 0 && free < m.diskWarnFreeBytes {
+		m.emitDiskEvent(events.StoreDiskWarn, free)
+		fmt.Fprintf(m.stderr, //nolint:errcheck
+			"store-maintenance: disk WARN — %.1f GiB free (warn %.1f GiB) on %s; proceeding\n",
+			float64(free)/gib, float64(m.diskWarnFreeBytes)/gib, m.cityPath)
+	}
+	return false
+}
+
+// emitDiskEvent records a StoreDiskWarn or StoreDiskCritical event.
+// Best-effort: JSON marshal errors are silently dropped.
+func (m *StoreMaintenanceLoop) emitDiskEvent(eventType string, free int64) {
+	if m.recorder == nil {
+		return
+	}
+	var payload events.Payload
+	switch eventType {
+	case events.StoreDiskWarn:
+		payload = events.StoreDiskWarnPayload{
+			FreeBytes:  free,
+			WarnBytes:  m.diskWarnFreeBytes,
+			FloorBytes: m.diskMinFreeBytes,
+			DataDir:    m.cityPath,
+		}
+	case events.StoreDiskCritical:
+		payload = events.StoreDiskCriticalPayload{
+			FreeBytes:  free,
+			FloorBytes: m.diskMinFreeBytes,
+			DataDir:    m.cityPath,
+		}
+	default:
+		return
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	m.recorder.Record(events.Event{
+		Type:    eventType,
+		Actor:   maintenanceActor,
+		Subject: m.cityPath,
+		Ts:      m.clock(),
+		Payload: raw,
+	})
 }
 
 // sendFailureAlert posts one best-effort operator alert mail for a

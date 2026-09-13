@@ -238,9 +238,9 @@ func TestLifecycle_DrainAckResponsiveRespawn(t *testing.T) {
 		runResponsiveRespawn(t, "60s", 40*time.Second, 50*time.Second)
 	})
 	t.Run("coldpool_arrival_2251", func(t *testing.T) {
-		// Short patrol: a cold pool (0 active) scales up to service the routed
-		// work and the post-drain replacement both land within a couple of
-		// ticks. Covers #2251's arrival ordering over the shared poke path.
+		// Short patrol: a cold pool (0 active) may use ordinary patrol timing to
+		// discover routed work. The measured post-drain replacement still covers
+		// #2251's arrival ordering over the shared drain-ack poke path.
 		runResponsiveRespawn(t, "10s", 30*time.Second, 30*time.Second)
 	})
 }
@@ -257,14 +257,14 @@ func runResponsiveRespawn(t *testing.T, patrolInterval string, maxRespawnLatency
 	c.Init("claude")
 
 	scriptCmd, markersPath := writeRespawnMarkerScript(t, c)
-	writeRespawnPoolConfig(c, scriptCmd, patrolInterval)
+	writeRespawnPoolConfig(t, c, scriptCmd, patrolInterval)
 	writePrequeuedRoutedBeads(t, c, "worker", 4)
 
 	c.StartWithSupervisor()
 
 	// The cold pool must scale from zero to service the routed work.
 	if !c.WaitForCondition(func() bool {
-		return len(readRespawnMarkers(markersPath)) >= 1
+		return len(readRespawnMarkers(t, markersPath)) >= 1
 	}, firstMarkerTimeout) {
 		out, _ := c.GC("status", "--city", c.Dir)
 		t.Fatalf("pool worker never spawned to service pre-queued routed work within %s\nstatus:\n%s", firstMarkerTimeout, out)
@@ -275,13 +275,13 @@ func runResponsiveRespawn(t *testing.T, patrolInterval string, maxRespawnLatency
 	// observed before we measure it.
 	deadline := time.Now().Add(maxRespawnLatency + 15*time.Second)
 	for time.Now().Before(deadline) {
-		if len(readRespawnMarkers(markersPath)) >= 2 {
+		if len(readRespawnMarkers(t, markersPath)) >= 2 {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	markers := readRespawnMarkers(markersPath)
+	markers := readRespawnMarkers(t, markersPath)
 	if len(markers) < 2 {
 		out, _ := c.GC("status", "--city", c.Dir)
 		t.Fatalf("replacement worker did not spawn after drain-ack (poke not honored?); markers=%v\nstatus:\n%s", markers, out)
@@ -313,7 +313,7 @@ func writeRespawnMarkerScript(t *testing.T, c *helpers.City) (scriptCmd, markers
 # so a replacement is reconciled immediately rather than on the next patrol
 # tick), then exits. No set -e: a failing drain-ack must not skip the marker.
 MARKERS=%q
-printf 'RUN %%s\n' "$(date +%%s.%%N)" >> "$MARKERS"
+printf 'RUN %%s\n' "$(date +%%s)" >> "$MARKERS"
 gc runtime drain-ack 2>/dev/null || true
 sleep 1
 exit 0
@@ -330,7 +330,8 @@ exit 0
 // (min=0/max=1, wake_mode=fresh) under the directory-based agents/worker/
 // surface. Inline [[agent]] tables in city.toml are a rejected PackV1 surface
 // under schema-2 enforcement, so the agent must live in agents/<name>/agent.toml.
-func writeRespawnPoolConfig(c *helpers.City, scriptCmd, patrolInterval string) {
+func writeRespawnPoolConfig(t *testing.T, c *helpers.City, scriptCmd, patrolInterval string) {
+	t.Helper()
 	cityName := filepath.Base(c.Dir)
 	c.WriteConfig(fmt.Sprintf(`[workspace]
 name = %q
@@ -394,71 +395,89 @@ func writePrequeuedRoutedBeads(t *testing.T, c *helpers.City, template string, n
 
 // readRespawnMarkers parses the marker file into spawn timestamps (epoch
 // seconds). A missing file yields no markers.
-func readRespawnMarkers(path string) []float64 {
+func readRespawnMarkers(t *testing.T, path string) []float64 {
+	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			t.Fatalf("reading respawn markers: %v", err)
+		}
 		return nil
 	}
 	var ts []float64
-	for _, line := range strings.Split(string(data), "\n") {
+	for lineNum, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "RUN ") {
 			continue
 		}
 		v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, "RUN ")), 64)
 		if err != nil {
-			continue
+			t.Fatalf("parsing respawn marker line %d %q: %v", lineNum+1, line, err)
 		}
 		ts = append(ts, v)
 	}
 	return ts
 }
 
-// TestLifecycle_PackMaterializationOnStart verifies that gc start
-// materializes gastown packs even if they were deleted after init.
-// This is the end-to-end regression test for Bug 4 (2026-03-18).
-func TestLifecycle_PackMaterializationOnStart(t *testing.T) {
+// TestLifecycle_PackCacheSelfHealsOnStart verifies that gc start re-hydrates
+// the user-global bundled pack cache even if it was deleted after init.
+// End-to-end regression test for Bug 4 (2026-03-18), updated for the
+// imports-based composition model: builtin packs at their canonical pins
+// resolve from the GC_HOME cache that the binary self-heals from its
+// embedded content.
+func TestLifecycle_PackCacheSelfHealsOnStart(t *testing.T) {
 	c := helpers.NewCity(t, testEnvB)
 	c.InitFrom(filepath.Join(helpers.ExamplesDir(), "gastown"))
 
-	// gc init --from now completes startup registration, so stop and
-	// unregister before exercising the explicit gc start path below.
+	// gc init --from now completes startup registration. Stopping a
+	// supervisor-managed city also unregisters it, leaving the fixture ready
+	// for the explicit gc start path below.
 	if out, err := c.GC("stop", c.Dir); err != nil {
 		t.Fatalf("gc stop after init-from failed: %v\n%s", err, out)
 	}
-	if out, err := c.GC("unregister", c.Dir); err != nil {
-		t.Fatalf("gc unregister after init-from failed: %v\n%s", err, out)
+	if out, err := c.GC("supervisor", "stop", "--wait"); err != nil {
+		t.Fatalf("gc supervisor stop after init-from failed: %v\n%s", err, out)
 	}
 
-	systemGastownPack := filepath.Join(".gc", "system", "packs", "gastown", "pack.toml")
-	systemMaintenancePack := filepath.Join(".gc", "system", "packs", "maintenance", "pack.toml")
-
-	// Verify managed system packs exist after init.
-	if !c.HasFile(systemGastownPack) {
-		t.Fatal(".gc/system/packs/gastown/pack.toml not materialized after init")
+	cacheRoot := filepath.Join(testEnvB.Get("GC_HOME"), "cache", "repos")
+	if _, err := os.Stat(cacheRoot); err != nil {
+		t.Fatalf("bundled pack cache missing after init: %v", err)
 	}
 
-	// Delete managed packs to simulate partial init failure.
-	if err := os.RemoveAll(filepath.Join(c.Dir, ".gc", "system", "packs")); err != nil {
-		t.Fatal(err)
+	// Atomically move the user-global cache aside to simulate eviction (or a
+	// fresh host). A recursive delete can race a pack-cache writer that was
+	// already winding down when the supervisor stopped.
+	evictedCacheRoot := cacheRoot + ".evicted"
+	if err := os.Rename(cacheRoot, evictedCacheRoot); err != nil {
+		t.Fatalf("evicting bundled pack cache: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(evictedCacheRoot); err != nil {
+			t.Errorf("removing evicted bundled pack cache: %v", err)
+		}
+	})
+	if _, err := os.Stat(cacheRoot); !os.IsNotExist(err) {
+		t.Fatalf("bundled pack cache still present after eviction: %v", err)
 	}
 
-	// gc start registers with the supervisor, which materializes managed packs
-	// during registration (before config load).
+	// gc start registers with the supervisor; builtin readiness re-hydrates
+	// the bundled cache before config load.
 	out, err := c.GC("start", c.Dir)
 	if err != nil {
 		t.Logf("gc start returned error (may be expected): %v\n%s", err, out)
 	}
 
-	// Wait for the supervisor to materialize managed packs (reconcile tick).
 	found := c.WaitForCondition(func() bool {
-		return c.HasFile(systemGastownPack)
+		entries, readErr := os.ReadDir(cacheRoot)
+		return readErr == nil && len(entries) > 0
 	}, 60*time.Second)
-
 	if !found {
-		t.Fatal(".gc/system/packs/gastown/pack.toml not re-materialized on start — Bug 4 regression")
+		t.Fatal("bundled pack cache not re-hydrated on start — Bug 4 regression")
 	}
-	if !c.HasFile(systemMaintenancePack) {
-		t.Fatal(".gc/system/packs/maintenance/pack.toml not re-materialized on start")
+
+	// The composed config must resolve every pinned import from the
+	// re-hydrated cache.
+	if out, err := c.GC("config", "show", "--validate"); err != nil {
+		t.Fatalf("gc config show --validate after self-heal failed: %v\n%s", err, out)
 	}
 }

@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/execenv"
+	gitpkg "github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
@@ -31,6 +33,24 @@ type slingBody struct {
 	ScopeKind      string            `json:"scope_kind"`
 	ScopeRef       string            `json:"scope_ref"`
 	Force          bool              `json:"force"`
+	Reassign       bool              `json:"reassign"`
+	Merge          string            `json:"merge"`
+	NoConvoy       bool              `json:"no_convoy"`
+	Owned          bool              `json:"owned"`
+	NoFormula      bool              `json:"no_formula"`
+}
+
+// routeOptsFromBody builds the domain RouteOpts from the wire body for a plain
+// bead route (direct or default-formula), carrying every server-expressible flag.
+func routeOptsFromBody(body slingBody) sling.RouteOpts {
+	return sling.RouteOpts{
+		Force:     body.Force,
+		Reassign:  body.Reassign,
+		Merge:     body.Merge,
+		NoConvoy:  body.NoConvoy,
+		Owned:     body.Owned,
+		NoFormula: body.NoFormula,
+	}
 }
 
 type slingResponse struct {
@@ -43,6 +63,8 @@ type slingResponse struct {
 	AttachedBeadID string   `json:"attached_bead_id,omitempty"`
 	Mode           string   `json:"mode,omitempty"`
 	Warnings       []string `json:"warnings,omitempty"`
+	DashboardURL   string   `json:"dashboard_url,omitempty" doc:"Absolute dashboard deep link for the slung work: the run detail view when a graph workflow was launched, otherwise the runs list. Present only when the serving process also hosts the dashboard (the supervisor listener); the standalone controller API omits it."`
+	Run            *RunRef  `json:"run,omitempty" doc:"Reference to the launched run resource, present only when a graph workflow was launched (the same run the Location header addresses)."`
 }
 
 var apiSlingStderr = func() io.Writer { return os.Stderr }
@@ -80,15 +102,42 @@ func (s *Server) execSling(ctx context.Context, body slingBody, _ string) (*slin
 		message := fmt.Sprintf("bead prefix store %s is not registered; cannot verify bead %q", storeRef, storeBeadID)
 		return nil, http.StatusBadRequest, "missing_bead", message, nil
 	}
+	// Mirror the CLI's tolerant source-workflow scan: a non-source rig store
+	// whose live-root scan fails degrades to an operator-visible warning
+	// instead of aborting the sling. Without this sink the domain keeps every
+	// non-source scan failure fatal (internal/sling/sling_core.go), so a single
+	// schema-skewed rig store would abort every workflow-launching sling that
+	// routes through a running city. Dedup per store ref so one degraded rig
+	// warns once per request, and collect the ordered messages so they surface
+	// to the caller in the response `warnings` field, not only the server log: a
+	// running-city sling routes through this handler, so the invoking human or
+	// agent sees only the JSON response and would otherwise be blind to the
+	// degraded cross-store conflict coverage.
+	sourceWorkflowScanWarnings := make(map[string]struct{})
+	var sourceWorkflowScanMessages []string
 	deps := sling.SlingDeps{
-		CityName: s.state.CityName(),
-		CityPath: s.state.CityPath(),
-		Cfg:      s.state.Config(),
-		SP:       s.state.SessionProvider(),
-		Store:    store,
-		StoreRef: storeRef,
+		CityName:   s.state.CityName(),
+		CityPath:   s.state.CityPath(),
+		Cfg:        s.state.Config(),
+		SP:         s.state.SessionProvider(),
+		Store:      store,
+		GraphStore: s.state.GraphBeadStore().Store,
+		Events:     s.state.EventProvider(),
+		StoreRef:   storeRef,
 		SourceWorkflowStores: func() ([]sling.SourceWorkflowStore, error) {
 			return s.sourceWorkflowStores(), nil
+		},
+		SourceWorkflowStoreScanWarning: func(scanStoreRef string, scanErr error) {
+			key := strings.TrimSpace(scanStoreRef)
+			if _, warned := sourceWorkflowScanWarnings[key]; warned {
+				return
+			}
+			sourceWorkflowScanWarnings[key] = struct{}{}
+			message := fmt.Sprintf(
+				"source-workflow singleton scan skipped unavailable store %s (%v); cross-store roots in that store are invisible",
+				scanStoreRef, scanErr)
+			sourceWorkflowScanMessages = append(sourceWorkflowScanMessages, message)
+			fmt.Fprintf(apiSlingStderr(), "warning: %s\n", message) //nolint:errcheck
 		},
 		Runner:   s.slingRunner(),
 		Router:   apiBeadRouter{server: s, store: store},
@@ -123,6 +172,10 @@ func (s *Server) execSling(ctx context.Context, body slingBody, _ string) (*slin
 		ScopeKind: body.ScopeKind,
 		ScopeRef:  body.ScopeRef,
 		Force:     body.Force,
+		Reassign:  body.Reassign,
+		Merge:     body.Merge,
+		NoConvoy:  body.NoConvoy,
+		Owned:     body.Owned,
 	}
 
 	// Dispatch to the right intent-based method.
@@ -142,6 +195,7 @@ func (s *Server) execSling(ctx context.Context, body slingBody, _ string) (*slin
 		result, err = sl.LaunchFormula(ctx, formulaName, agentCfg, formulaOpts)
 
 	case strings.TrimSpace(body.Bead) != "" &&
+		!body.NoFormula &&
 		agentCfg.EffectiveDefaultSlingFormula() != "" &&
 		(len(body.Vars) > 0 || body.Title != "" || body.ScopeKind != "" || body.ScopeRef != ""):
 		mode = "attached"
@@ -149,10 +203,10 @@ func (s *Server) execSling(ctx context.Context, body slingBody, _ string) (*slin
 		attachedBeadID = strings.TrimSpace(body.Bead)
 		formulaName = agentCfg.EffectiveDefaultSlingFormula()
 		// Default formula: route the bead and let the domain apply the default.
-		result, err = sl.RouteBead(ctx, attachedBeadID, agentCfg, sling.RouteOpts{Force: body.Force})
+		result, err = sl.RouteBead(ctx, attachedBeadID, agentCfg, routeOptsFromBody(body))
 
 	default:
-		result, err = sl.RouteBead(ctx, body.Bead, agentCfg, sling.RouteOpts{Force: body.Force})
+		result, err = sl.RouteBead(ctx, body.Bead, agentCfg, routeOptsFromBody(body))
 	}
 
 	if err != nil {
@@ -180,12 +234,20 @@ func (s *Server) execSling(ctx context.Context, body slingBody, _ string) (*slin
 		return nil, http.StatusBadRequest, "invalid", err.Error(), nil
 	}
 
+	// Surface both the domain's non-fatal metadata errors and the tolerated
+	// source-workflow scan warnings to the caller. The scan messages reach only
+	// the server log otherwise, leaving a remote caller blind to degraded
+	// cross-store conflict coverage.
+	warnings := result.MetadataErrors
+	if len(sourceWorkflowScanMessages) > 0 {
+		warnings = append(append([]string(nil), result.MetadataErrors...), sourceWorkflowScanMessages...)
+	}
 	resp := &slingResponse{
 		Status:   "slung",
 		Target:   body.Target,
 		Bead:     body.Bead,
 		Mode:     mode,
-		Warnings: result.MetadataErrors,
+		Warnings: warnings,
 	}
 	if !workflowLaunch {
 		return resp, http.StatusOK, "", "", nil
@@ -290,9 +352,33 @@ func (s *Server) slingStoreScopeForBead(beadID string) (rigName string, cityScop
 	return rig.Name, false
 }
 
+// sourceWorkflowStores lists every store the source-bead singleton guard must
+// scan for a live workflow root.
+//
+// Graph-first, for the same reason workflowStores() leads with the graph store:
+// a workflow root is graph class, so on a city that relocates the graph class
+// every live root is in the binding and NOT in the work stores below. Scanning
+// only those answered "no conflict" from stores that structurally cannot hold
+// the answer, and the sling admitted a second live workflow beside the first
+// (ga-nqdff). The leg is STRICT — a fault on the store that holds the answer
+// refuses the sling instead of degrading to the tolerated non-source-store
+// warning, because a binding fault is an error, never absence.
+//
+// It is skipped on a default (non-relocated) city, where GraphBeadStore() ==
+// CityBeadStore(), so the single-store enumeration stays byte-identical and no
+// store is scanned twice. Its ref reuses workflowStores()'s "graph:<city>"
+// spelling so the store_ref round trip has one parse, not two.
 func (s *Server) sourceWorkflowStores() []sling.SourceWorkflowStore {
-	stores := make([]sling.SourceWorkflowStore, 0, len(s.state.BeadStores())+1)
-	if cityStore := s.state.CityBeadStore(); cityStore != nil {
+	stores := make([]sling.SourceWorkflowStore, 0, len(s.state.BeadStores())+2)
+	cityStore := s.state.CityBeadStore()
+	if graphStore := s.state.GraphBeadStore().Store; graphStore != nil && graphStore != cityStore {
+		stores = append(stores, sling.SourceWorkflowStore{
+			Store:    graphStore,
+			StoreRef: sourceworkflow.GraphStoreRef(s.state.CityName()),
+			Strict:   true,
+		})
+	}
+	if cityStore != nil {
 		stores = append(stores, sling.SourceWorkflowStore{
 			Store:    cityStore,
 			StoreRef: "city:" + s.state.CityName(),
@@ -389,8 +475,12 @@ func (r apiBranchResolver) DefaultBranch(dir string) string {
 	}
 	// Best-effort: read git's origin/HEAD ref for the default branch.
 	// Falls back to empty string if git is unavailable.
-	out, err := exec.CommandContext(context.Background(), "git", "-C", dir,
-		"symbolic-ref", "--short", "refs/remotes/origin/HEAD").Output()
+	cmd := exec.CommandContext(context.Background(), "git", "-C", dir,
+		"symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	// Sanitize the environment so a leaked GIT_DIR from a parent repo or hook
+	// cannot redirect resolution to the wrong repository's default branch.
+	cmd.Env = gitpkg.SanitizedEnv()
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -441,7 +531,7 @@ func (r apiBeadRouter) Route(_ context.Context, req sling.RouteRequest) error {
 	if cfg != nil {
 		routedTo = agentutil.NormalizePoolRouteTarget(cfg, req.Target)
 	}
-	if err := r.store.SetMetadata(req.BeadID, "gc.routed_to", routedTo); err != nil {
+	if err := r.store.SetMetadata(req.BeadID, beadmeta.RoutedToMetadataKey, routedTo); err != nil {
 		if req.Force && errors.Is(err, beads.ErrNotFound) {
 			return nil
 		}

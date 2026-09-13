@@ -9,10 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
@@ -64,6 +66,23 @@ func (f *fakeCityResolver) ConsumePendingRequestID(cityPath string) (string, boo
 
 func (f *fakeCityResolver) SupervisorEventRecorder() events.Recorder {
 	return f.supervisorRecorder
+}
+
+// blockingConfigState holds every concurrent Server construction at its first
+// State access until all callers have missed the supervisor cache.
+type blockingConfigState struct {
+	*fakeState
+	constructors int32
+	configCalls  atomic.Int32
+	allStarted   chan struct{}
+}
+
+func (s *blockingConfigState) Config() *config.City {
+	if s.configCalls.Add(1) == s.constructors {
+		close(s.allStarted)
+	}
+	<-s.allStarted
+	return s.fakeState.Config()
 }
 
 func newTestSupervisorMux(t *testing.T, cities map[string]*fakeState) *SupervisorMux {
@@ -244,6 +263,42 @@ func TestSupervisorCityNamespacedRoute(t *testing.T) {
 	}
 }
 
+func TestSupervisorGetCityServerConcurrentCallsReturnCanonicalServer(t *testing.T) {
+	const callers = 8
+
+	state := &blockingConfigState{
+		fakeState:    newFakeState(t),
+		constructors: callers,
+		allStarted:   make(chan struct{}),
+	}
+	state.cityName = "bright-lights"
+	sm := newTestSupervisorMux(t, nil)
+
+	start := make(chan struct{})
+	servers := make(chan *Server, callers)
+	for range callers {
+		go func() {
+			<-start
+			servers <- sm.getCityServer(state.CityName(), state)
+		}()
+	}
+	close(start)
+
+	want := <-servers
+	for i := 1; i < callers; i++ {
+		if got := <-servers; got != want {
+			t.Fatalf("concurrent caller %d got Server %p, want canonical Server %p", i, got, want)
+		}
+	}
+
+	sm.cacheMu.RLock()
+	cached := sm.cache[state.CityName()].srv
+	sm.cacheMu.RUnlock()
+	if cached != want {
+		t.Fatalf("cached Server = %p, want returned canonical Server %p", cached, want)
+	}
+}
+
 func TestSupervisorCityScopedRoute404sUntilCityRunning(t *testing.T) {
 	resolver := &fakeCityResolver{
 		cities: map[string]*fakeState{},
@@ -362,6 +417,7 @@ func TestSupervisorHandlerAllowsCityScopedDirectServiceMutationWithoutCSRF(t *te
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v0/city/bright-lights/svc/github-webhook/v0/github/webhook", strings.NewReader(`{}`))
+	req.Host = "localhost"
 	req.RemoteAddr = "198.51.100.10:9000"
 	rec := httptest.NewRecorder()
 	sm.Handler().ServeHTTP(rec, req)

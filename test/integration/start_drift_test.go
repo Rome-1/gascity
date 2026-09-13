@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -442,6 +443,10 @@ func setupDriftDirectScenario(t *testing.T) *driftScenario {
 		t.Fatalf("creating drift binary dir: %v", err)
 	}
 	binaryPath := filepath.Join(binaryDir, "gc-drift")
+	// Registered before anything is launched so it runs LAST (t.Cleanup is
+	// LIFO): the per-PID stops get their chance first, then this sweeps up
+	// any supervisor the drift restart replaced them with.
+	t.Cleanup(func() { reapDriftSupervisors(binaryPath) })
 	buildGCBinaryWithCommit(t, binaryPath, driftHappyOldCommit)
 
 	pid := launchDirectSupervisor(t, binaryPath, env, gcHome)
@@ -454,10 +459,6 @@ func setupDriftDirectScenario(t *testing.T) *driftScenario {
 	// inode; /proc/<pid>/exe still resolves to binaryPath, which now
 	// points to the new bytes.
 	buildGCBinaryWithCommit(t, binaryPath, driftHappyNewCommit)
-
-	t.Cleanup(func() {
-		stopDirectSupervisor(pid)
-	})
 
 	_ = runtimeDir
 	return &driftScenario{
@@ -584,6 +585,7 @@ func setupDriftDirectScenarioWithoutLaunch(t *testing.T) *driftScenario {
 	// secondary uid can exec the binary even though the test owns the
 	// parent dir.
 	binaryPath := filepath.Join(binaryDir, "gc-drift")
+	t.Cleanup(func() { reapDriftSupervisors(binaryPath) })
 	buildGCBinaryWithCommit(t, binaryPath, driftHappyOldCommit)
 	if err := os.Chmod(binaryPath, 0o755); err != nil {
 		t.Fatalf("chmod binary: %v", err)
@@ -625,8 +627,8 @@ func buildGCBinaryWithCommit(t *testing.T, outPath, commitID string) {
 }
 
 // launchDirectSupervisor spawns `binary supervisor run` in the
-// background as the test process. Returns the PID. The caller is
-// responsible for stopping the supervisor via t.Cleanup.
+// background as the test process and registers its own t.Cleanup to stop
+// it. Returns the PID.
 func launchDirectSupervisor(t *testing.T, binary string, env []string, gcHome string) int {
 	t.Helper()
 	logPath := filepath.Join(gcHome, "supervisor.log")
@@ -645,7 +647,16 @@ func launchDirectSupervisor(t *testing.T, binary string, env []string, gcHome st
 		t.Fatalf("starting drift supervisor: %v", err)
 	}
 	pid := cmd.Process.Pid
-	t.Cleanup(func() { _ = logFile.Close() })
+	// Register the stop BEFORE returning. Callers do fatal-capable setup
+	// work (health polls, `gc init`, a second `go build`) between this call
+	// and any cleanup they register themselves; a t.Fatalf in there runs the
+	// cleanups already registered and skips the rest, so a stop registered by
+	// the caller afterwards never exists and this supervisor survives the run
+	// (ga-ccltia).
+	t.Cleanup(func() {
+		stopDirectSupervisor(pid)
+		_ = logFile.Close()
+	})
 	return pid
 }
 
@@ -667,13 +678,92 @@ func stopDirectSupervisor(pid int) {
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
+// supervisorPIDsFromBinary returns every live PID whose /proc/<pid>/exe
+// resolves to binaryPath. The kernel appends " (deleted)" to the link
+// target once the drift scenario overwrites the binary in place, so that
+// suffix is trimmed before comparing.
+func supervisorPIDsFromBinary(binaryPath string) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		exe, err := os.Readlink(filepath.Join("/proc", entry.Name(), "exe"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSuffix(exe, " (deleted)") == binaryPath {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// reapDriftSupervisors stops every supervisor still running from
+// binaryPath, whatever its PID.
+//
+// A cleanup keyed on the launch-time PID is not sufficient: the
+// drift-restart path under test kills the running supervisor and spawns a
+// REPLACEMENT via spawnDetachedSupervisor (cmd/gc/cmd_start_drift.go),
+// which is deliberately detached so `gc start` can return without taking
+// it down. The replacement has a new PID that no test ever learns, so
+// nothing reaped it and it outlived the run — 74 such supervisors,
+// 2.1GB RSS, were found alive after two days (ga-ccltia).
+//
+// binaryPath is unique per isolated env root, so this only ever reaps
+// this test's own supervisors, never a sibling test's or the developer's.
+func reapDriftSupervisors(binaryPath string) {
+	for _, pid := range supervisorPIDsFromBinary(binaryPath) {
+		stopDirectSupervisor(pid)
+	}
+}
+
+// TestSupervisorPIDsFromBinary_MatchesRunningProcess pins the two parts of
+// the exe-match that fail silently: the " (deleted)" trim, and matching a
+// live process at all. The test binary itself is the fixture, so this
+// spawns nothing.
+func TestSupervisorPIDsFromBinary_MatchesRunningProcess(t *testing.T) {
+	requireLinuxProcExe(t)
+	self, err := os.Readlink("/proc/self/exe")
+	if err != nil {
+		t.Skipf("reading /proc/self/exe: %v", err)
+	}
+	self = strings.TrimSuffix(self, " (deleted)")
+
+	pids := supervisorPIDsFromBinary(self)
+	found := false
+	for _, pid := range pids {
+		if pid == os.Getpid() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("supervisorPIDsFromBinary(%q) = %v, want it to contain this process (%d)", self, pids, os.Getpid())
+	}
+
+	if got := supervisorPIDsFromBinary(filepath.Join(t.TempDir(), "no-such-binary")); len(got) != 0 {
+		t.Errorf("supervisorPIDsFromBinary(nonexistent) = %v, want empty", got)
+	}
+}
+
 // bootstrapDriftCity runs `gc init` to scaffold a minimal city using
 // the supplied gc binary, returning the city dir.
 func bootstrapDriftCity(t *testing.T, binary string, env []string, gcHome string) string {
 	t.Helper()
 	cityName := "drift-" + filepath.Base(t.TempDir())
 	cityDir := filepath.Join(filepath.Dir(gcHome), cityName)
-	cmd := exec.Command(binary, "init", "--skip-provider-readiness", cityDir)
+	cmd := exec.Command(binary, "init",
+		"--skip-provider-readiness",
+		"--providers", "codex",
+		"--default-provider", "codex",
+		cityDir,
+	)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -911,10 +1001,43 @@ func writeKillSwitch(t *testing.T, cityDir string, enabled bool) {
 	if !enabled {
 		val = "false"
 	}
-	addition := fmt.Sprintf("\n[daemon]\nauto_restart_on_drift = %s\n", val)
-	if err := os.WriteFile(tomlPath, append(data, []byte(addition)...), 0o644); err != nil {
+	next := setDaemonKeyForTest(string(data), "auto_restart_on_drift", val)
+	if err := os.WriteFile(tomlPath, []byte(next), 0o644); err != nil {
 		t.Fatalf("writing city.toml: %v", err)
 	}
+}
+
+func setDaemonKeyForTest(src, key, value string) string {
+	lines := strings.SplitAfter(src, "\n")
+	daemonStart := -1
+	daemonEnd := len(lines)
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "[daemon]" {
+			daemonStart = i
+			continue
+		}
+		if daemonStart >= 0 && i > daemonStart && strings.HasPrefix(strings.TrimSpace(line), "[") {
+			daemonEnd = i
+			break
+		}
+	}
+	entry := fmt.Sprintf("%s = %s\n", key, value)
+	if daemonStart < 0 {
+		if len(src) > 0 && !strings.HasSuffix(src, "\n") {
+			src += "\n"
+		}
+		return src + "\n[daemon]\n" + entry
+	}
+	for i := daemonStart + 1; i < daemonEnd; i++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), key+" ") || strings.HasPrefix(strings.TrimSpace(lines[i]), key+"=") {
+			lines[i] = entry
+			return strings.Join(lines, "")
+		}
+	}
+	next := append([]string{}, lines[:daemonStart+1]...)
+	next = append(next, entry)
+	next = append(next, lines[daemonStart+1:]...)
+	return strings.Join(next, "")
 }
 
 // writeStuckSupervisorShim overwrites binaryPath with a shell script

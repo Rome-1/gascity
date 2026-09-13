@@ -188,6 +188,29 @@ func resolvePoolInstanceQualified(cfg *config.City, input string) (config.Agent,
 	return config.Agent{}, false
 }
 
+// RoutedToIdentity returns the canonical gc.routed_to value for agent: its
+// PoolName when set, otherwise its own QualifiedName(). PoolName is set only
+// on pool-instance copies synthesized from a base template (see
+// cmd/gc/pool.go), and always holds that base template's own
+// QualifiedName() — so this collapses a pool instance back to the identity
+// its base template routes under.
+//
+// Every writer that stamps gc.routed_to and every reader that resolves it
+// must derive the value through this function. Calling QualifiedName()
+// directly bypasses the PoolName collapse: a pool-instance agent's routing
+// then diverges from what gc sling stamped for its base template, and the
+// bead becomes invisible to pool demand/claim (this has been independently
+// gotten wrong at multiple call sites — see ga-79uuwq).
+func RoutedToIdentity(agent *config.Agent) string {
+	if agent == nil {
+		return ""
+	}
+	if agent.PoolName != "" {
+		return agent.PoolName
+	}
+	return agent.QualifiedName()
+}
+
 // NormalizePoolRouteTarget collapses a slot-suffixed pool target qualified
 // name (e.g. "myrig/polecat-2") back to its base pool qualified name
 // ("myrig/polecat"). Slinging to a slot-suffixed target expresses a
@@ -201,9 +224,19 @@ func resolvePoolInstanceQualified(cfg *config.City, input string) (config.Agent,
 // a configured multi-session pool agent and N is a valid slot (>=1, and within
 // the agent's max when bounded) — the inverse of resolvePoolInstanceQualified.
 // Any other target (base names, non-pool agents, out-of-range or non-numeric
-// suffixes, unknown agents) is returned unchanged.
+// suffixes, unknown agents) is returned unchanged. A target that is itself a
+// configured agent's qualified name is likewise never collapsed.
 func NormalizePoolRouteTarget(cfg *config.City, target string) string {
 	if cfg == nil || target == "" {
+		return target
+	}
+	// Literal-before-slot precedence, mirroring ResolveAgent: a literal
+	// qualified match (step 2) wins over pool-instance synthesis (step 2b).
+	// A target that names a configured agent outright is a real routing
+	// destination, not a load-balancing hint, so it must never collapse into
+	// a same-prefixed pool base — e.g. an agent "myrig/polecat-4090" next to
+	// an unbounded pool "myrig/polecat" would otherwise lose its identity.
+	if _, ok := findAgentByQualified(cfg, target); ok {
 		return target
 	}
 	for i := range cfg.Agents {
@@ -211,7 +244,7 @@ func NormalizePoolRouteTarget(cfg *config.City, target string) string {
 		if !IsMultiSessionAgent(&a) {
 			continue
 		}
-		base := a.QualifiedName()
+		base := RoutedToIdentity(&a)
 		prefix := base + "-"
 		if !strings.HasPrefix(target, prefix) {
 			continue
@@ -239,11 +272,29 @@ func AgentReachesWorkflowStore(storeRef string, agentCfg *config.Agent, cityPath
 	if cfg == nil || agentCfg == nil {
 		return true
 	}
+	// City-scoped agents are cross-store eligible: a city-wide singleton
+	// legitimately serves work in ANY store (vp-kvp). Without this exemption the
+	// cross-store route guard (validateBuiltInRouteStoreReachable) would
+	// false-positive on a legitimate route to a city-scoped target and refuse
+	// it — the very dead-drop stages ii/iii exist to remove. Rig-scoped agents
+	// stay single-store, so all existing reachability is unchanged.
+	if AgentIsCrossStoreEligible(agentCfg) {
+		return true
+	}
 	agentRig := workdirutil.ConfiguredRigName(cityPath, *agentCfg, cfg.Rigs)
 	if agentRig == "" {
 		return strings.HasPrefix(storeRef, "city:")
 	}
 	return storeRef == "rig:"+agentRig
+}
+
+// AgentIsCrossStoreEligible reports whether an agent may discover and serve
+// work in ANY store, not just its configured rig. City-scoped agents are
+// cross-store eligible: a city-wide singleton legitimately serves per-rig
+// routed work (vp-kvp — "scope determines discovery breadth"). Centralized
+// here so domain packages and the CLI share one definition.
+func AgentIsCrossStoreEligible(agentCfg *config.Agent) bool {
+	return agentCfg != nil && strings.TrimSpace(agentCfg.Scope) == "city"
 }
 
 // AgentReachableStoreLabel returns the workflow store ref an agent's

@@ -286,7 +286,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBead_UsesLiveOpenOwnership(t *testin
 	}
 
 	unclaimWorkAssignedToRetiredSessionBead(
-		cache,
+		"", nil, cache,
 		nil,
 		beads.Bead{ID: "retired-session"},
 		"worker",
@@ -318,7 +318,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBead_IncludesEphemeralWork(t *testin
 	}
 
 	unclaimWorkAssignedToRetiredSessionBead(
-		store,
+		"", nil, store,
 		nil,
 		beads.Bead{ID: "retired-session"},
 		"worker",
@@ -335,8 +335,11 @@ func TestUnclaimWorkAssignedToRetiredSessionBead_IncludesEphemeralWork(t *testin
 	if got.Assignee != "" {
 		t.Fatalf("Assignee = %q, want empty", got.Assignee)
 	}
-	if got.Metadata["gc.routed_to"] != "worker" {
-		t.Fatalf("gc.routed_to = %q, want worker", got.Metadata["gc.routed_to"])
+	if got.Metadata["gc.run_target"] != "worker" {
+		t.Fatalf("gc.run_target = %q, want worker", got.Metadata["gc.run_target"])
+	}
+	if got.Metadata["gc.routed_to"] != "" {
+		t.Fatalf("gc.routed_to = %q, want empty canonical route fallback", got.Metadata["gc.routed_to"])
 	}
 }
 
@@ -356,7 +359,7 @@ func TestReassignWorkAssignedToRetiredSessionBead_IncludesEphemeralWork(t *testi
 	}
 
 	reassignWorkAssignedToRetiredSessionBead(
-		store,
+		"", nil, store,
 		nil,
 		beads.Bead{ID: "retired-session"},
 		"replacement-session",

@@ -62,6 +62,75 @@ func TestDurationRangeCheck_TooSmall(t *testing.T) {
 	}
 }
 
+func TestDurationRangeCheck_ProgressStallTimeoutTooSmall(t *testing.T) {
+	cfg := &config.City{
+		Session: config.SessionConfig{
+			ProgressStallTimeout: "30s",
+		},
+	}
+	c := NewDurationRangeCheck(cfg)
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusWarning {
+		t.Errorf("status = %d, want Warning", r.Status)
+	}
+	found := false
+	for _, d := range r.Details {
+		if strings.Contains(d, "progress_stall_timeout") && strings.Contains(d, "below minimum") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected progress_stall_timeout below-minimum warning in details: %v", r.Details)
+	}
+}
+
+func TestDurationRangeCheck_ProgressStallTimeoutZeroDisables(t *testing.T) {
+	cfg := &config.City{
+		Session: config.SessionConfig{
+			ProgressStallTimeout: "0s",
+		},
+	}
+	c := NewDurationRangeCheck(cfg)
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Errorf("status = %d, want OK; details = %v", r.Status, r.Details)
+	}
+}
+
+func TestDurationRangeCheck_ProgressStallTimeoutNegativeDisables(t *testing.T) {
+	cfg := &config.City{
+		Session: config.SessionConfig{
+			ProgressStallTimeout: "-5m",
+		},
+	}
+	c := NewDurationRangeCheck(cfg)
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Errorf("status = %d, want OK; details = %v", r.Status, r.Details)
+	}
+}
+
+func TestDurationRangeCheck_ClaimHolderStallTimeout(t *testing.T) {
+	t.Run("too small warns", func(t *testing.T) {
+		cfg := &config.City{Session: config.SessionConfig{ClaimHolderStallTimeout: "1m"}}
+		r := NewDurationRangeCheck(cfg).Run(&CheckContext{})
+		if r.Status != StatusWarning {
+			t.Errorf("status = %d, want Warning", r.Status)
+		}
+		if !strings.Contains(strings.Join(r.Details, "\n"), "claim_holder_stall_timeout") {
+			t.Errorf("details = %v, want claim_holder_stall_timeout warning", r.Details)
+		}
+	})
+
+	t.Run("zero disables", func(t *testing.T) {
+		cfg := &config.City{Session: config.SessionConfig{ClaimHolderStallTimeout: "0s"}}
+		r := NewDurationRangeCheck(cfg).Run(&CheckContext{})
+		if r.Status != StatusOK {
+			t.Errorf("status = %d, want OK; details = %v", r.Status, r.Details)
+		}
+	})
+}
+
 func TestDurationRangeCheck_TooLarge(t *testing.T) {
 	cfg := &config.City{
 		Daemon: config.DaemonConfig{

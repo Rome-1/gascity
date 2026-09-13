@@ -7,18 +7,19 @@ import "github.com/gastownhall/gascity/internal/api/genclient"
 // sessionResponse fields that the CLI formatter reads so cmd/gc/ never
 // imports genclient directly.
 type SessionView struct {
-	ID          string
-	Template    string
-	State       string
-	Reason      string
-	Title       string
-	Alias       string
-	SessionName string
-	CreatedAt   string
-	LastActive  string
-	Attached    bool
-	Running     bool
-	LastOutput  string
+	ID          string `json:"id"`
+	Template    string `json:"template"`
+	State       string `json:"state"`
+	Reason      string `json:"reason"`
+	Title       string `json:"title"`
+	Alias       string `json:"alias"`
+	SessionName string `json:"session_name"`
+	WorkDir     string `json:"work_dir"`
+	CreatedAt   string `json:"created_at"`
+	LastActive  string `json:"last_active"`
+	Attached    bool   `json:"attached"`
+	Running     bool   `json:"running"`
+	LastOutput  string `json:"last_output"`
 }
 
 // sessionViewFromGen translates one genclient.SessionResponse into a
@@ -33,6 +34,9 @@ func sessionViewFromGen(g genclient.SessionResponse) SessionView {
 		CreatedAt:   g.CreatedAt,
 		Attached:    g.Attached,
 		Running:     g.Running,
+	}
+	if g.WorkDir != nil {
+		out.WorkDir = *g.WorkDir
 	}
 	if g.Reason != nil {
 		out.Reason = *g.Reason

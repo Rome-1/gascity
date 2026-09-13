@@ -13,6 +13,7 @@ import (
 
 func TestEnsureGitignoreEntries_CreatesNewFile(t *testing.T) {
 	f := fsys.NewFake()
+	f.Dirs["/city"] = true
 
 	if err := ensureGitignoreEntries(f, "/city", cityGitignoreEntries); err != nil {
 		t.Fatalf("ensureGitignoreEntries: %v", err)
@@ -36,6 +37,7 @@ func TestEnsureGitignoreEntries_CreatesNewFile(t *testing.T) {
 
 func TestEnsureGitignoreEntries_RigEntriesKeepBeadsRuntimeIgnored(t *testing.T) {
 	f := fsys.NewFake()
+	f.Dirs["/rig"] = true
 
 	if err := ensureGitignoreEntries(f, "/rig", rigGitignoreEntries); err != nil {
 		t.Fatalf("ensureGitignoreEntries: %v", err)
@@ -47,7 +49,7 @@ func TestEnsureGitignoreEntries_RigEntriesKeepBeadsRuntimeIgnored(t *testing.T) 
 			t.Errorf("rig .gitignore missing %q; got:\n%s", want, got)
 		}
 	}
-	for _, forbidden := range []string{".gc/", "hooks/", ".runtime/", "!.beads/config.yaml", "!.beads/metadata.json"} {
+	for _, forbidden := range []string{".gc/", "hooks/", "!.beads/config.yaml", "!.beads/metadata.json"} {
 		if strings.Contains(got, forbidden) {
 			t.Errorf("rig .gitignore should not contain %q; got:\n%s", forbidden, got)
 		}
@@ -136,6 +138,7 @@ func TestEnsureGitignoreEntries_SkipsExisting(t *testing.T) {
 
 func TestEnsureGitignoreEntries_Idempotent(t *testing.T) {
 	f := fsys.NewFake()
+	f.Dirs["/city"] = true
 
 	entries := cityGitignoreEntries
 	for i := 0; i < 3; i++ {
@@ -155,7 +158,7 @@ func TestEnsureGitignoreEntries_Idempotent(t *testing.T) {
 
 func TestEnsureGitignoreEntries_NoOpWhenAllPresent(t *testing.T) {
 	f := fsys.NewFake()
-	original := ".gc/\n.beads/*\n!.beads/identity.toml\nhooks/\n.runtime/\n"
+	original := ".gc/\n.beads/*\n!.beads/identity.toml\nhooks/\n"
 	f.Files[filepath.Join("/city", ".gitignore")] = []byte(original)
 
 	if err := ensureGitignoreEntries(f, "/city", cityGitignoreEntries); err != nil {
@@ -227,6 +230,7 @@ func TestEnsureGitignoreEntries_IdentityTomlNegationPresent(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := fsys.NewFake()
+			f.Dirs[tc.dir] = true
 			if err := ensureGitignoreEntries(f, tc.dir, tc.entries); err != nil {
 				t.Fatalf("ensureGitignoreEntries: %v", err)
 			}
@@ -254,6 +258,7 @@ func TestEnsureGitignoreEntries_IdentityTomlNegationAfterGlob(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := fsys.NewFake()
+			f.Dirs[tc.dir] = true
 			if err := ensureGitignoreEntries(f, tc.dir, tc.entries); err != nil {
 				t.Fatalf("ensureGitignoreEntries: %v", err)
 			}

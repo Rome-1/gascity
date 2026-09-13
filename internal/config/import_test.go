@@ -33,8 +33,9 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 	}
 }
 
-func stubCleanRepoCacheGit(t *testing.T, commit string) {
+func stubCleanRepoCacheGit(t *testing.T) string {
 	t.Helper()
+	const commit = "abc123def456"
 	prev := runRepoCacheGit
 	runRepoCacheGit = func(dir string, args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
@@ -46,6 +47,7 @@ func stubCleanRepoCacheGit(t *testing.T, commit string) {
 		return prev(dir, args...)
 	}
 	t.Cleanup(func() { runRepoCacheGit = prev })
+	return commit
 }
 
 //nolint:unparam // test helper keeps the permission explicit at each call site.
@@ -116,7 +118,7 @@ scope = "city"
 	}
 }
 
-func TestImport_RejectsPackAgentDefaultsDefaultSlingFormula(t *testing.T) {
+func TestImport_PackAgentDefaultsApplyToImportedAgents(t *testing.T) {
 	dir := t.TempDir()
 	cityDir := filepath.Join(dir, "city")
 	importDir := filepath.Join(dir, "tools")
@@ -140,24 +142,113 @@ source = "../tools"
 name = "tools"
 schema = 1
 
+[providers.claude]
+base = "builtin:claude"
+
+[providers.codex]
+base = "builtin:codex"
+
 [agent_defaults]
+provider = "codex"
 default_sling_formula = "mol-pack-default"
+
+[[agent]]
+name = "worker"
+scope = "city"
+
+[[agent]]
+name = "reviewer"
+scope = "city"
+provider = "claude"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	var worker, reviewer *Agent
+	for i := range cfg.Agents {
+		switch cfg.Agents[i].QualifiedName() {
+		case "tools.worker":
+			worker = &cfg.Agents[i]
+		case "tools.reviewer":
+			reviewer = &cfg.Agents[i]
+		}
+	}
+	if worker == nil || reviewer == nil {
+		t.Fatalf("expected imported worker and reviewer, got worker=%v reviewer=%v", worker != nil, reviewer != nil)
+	}
+	if got := worker.Provider; got != "codex" {
+		t.Fatalf("worker Provider = %q, want codex", got)
+	}
+	if got := worker.EffectiveDefaultSlingFormula(); got != "mol-pack-default" {
+		t.Fatalf("worker EffectiveDefaultSlingFormula = %q, want mol-pack-default", got)
+	}
+	if got := reviewer.Provider; got != "claude" {
+		t.Fatalf("reviewer Provider = %q, want explicit claude", got)
+	}
+}
+
+func TestImport_PackAgentDefaultsProviderOverridesCityDefaultForImportedAgent(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	importDir := filepath.Join(dir, "tools")
+	mustMkdirAll(t, cityDir, 0o755)
+	mustMkdirAll(t, importDir, 0o755)
+
+	writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+
+[providers.codex]
+base = "builtin:codex"
+
+[providers.gemini]
+base = "builtin:gemini"
+
+[agent_defaults]
+provider = "gemini"
+`)
+	writeTestFile(t, cityDir, "pack.toml", `
+[pack]
+name = "test"
+schema = 1
+
+[imports.tools]
+source = "../tools"
+`)
+	writeTestFile(t, importDir, "pack.toml", `
+[pack]
+name = "tools"
+schema = 1
+
+[providers.codex]
+base = "builtin:codex"
+
+[agent_defaults]
+provider = "codex"
 
 [[agent]]
 name = "worker"
 scope = "city"
 `)
 
-	_, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
-	if err == nil {
-		t.Fatal("expected LoadWithIncludes to reject imported pack [agent_defaults]")
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
 	}
-	if !strings.Contains(err.Error(), "[agent_defaults] is a city.toml table, not a pack.toml field") {
-		t.Fatalf("error = %v, want pack authoring surface rejection", err)
+
+	for _, a := range cfg.Agents {
+		if a.QualifiedName() != "tools.worker" {
+			continue
+		}
+		if got := a.Provider; got != "codex" {
+			t.Fatalf("tools.worker Provider = %q, want imported pack default codex", got)
+		}
+		return
 	}
-	if !strings.Contains(err.Error(), filepath.Join(importDir, "pack.toml")) {
-		t.Fatalf("error = %v, want offending imported pack path", err)
-	}
+	t.Fatalf("imported agent tools.worker not found: %+v", explicitAgents(cfg.Agents))
 }
 
 func TestImport_CityAgentDefaultsDefaultSlingFormulaAppliesToImportedAgent(t *testing.T) {
@@ -202,6 +293,236 @@ scope = "city"
 		return
 	}
 	t.Fatalf("imported agent tools.worker not found: %+v", explicitAgents(cfg.Agents))
+}
+
+func TestImport_CityImportRigScopedConventionAgentsExpandPerRig(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	importDir := filepath.Join(dir, "superpowers")
+	mustMkdirAll(t, cityDir, 0o755)
+	mustMkdirAll(t, importDir, 0o755)
+
+	writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+
+[imports.superpowers]
+source = "../superpowers"
+
+[[rigs]]
+name = "fixture"
+path = "/tmp/fixture"
+`)
+	writeTestFile(t, importDir, "pack.toml", `
+[pack]
+name = "superpowers"
+schema = 2
+`)
+	writeTestFile(t, filepath.Join(importDir, "agents", "code-reviewer"), "agent.toml", `
+scope = "rig"
+`)
+	writeTestFile(t, filepath.Join(importDir, "agents", "code-reviewer"), "prompt.template.md", "review code\n")
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	for _, a := range explicitAgents(cfg.Agents) {
+		if a.QualifiedName() != "fixture/superpowers.code-reviewer" {
+			continue
+		}
+		if a.BindingName != "superpowers" {
+			t.Errorf("BindingName = %q, want superpowers", a.BindingName)
+		}
+		if a.SourceDir != importDir {
+			t.Errorf("SourceDir = %q, want %q", a.SourceDir, importDir)
+		}
+		if want := filepath.Join(importDir, "agents", "code-reviewer", "prompt.template.md"); a.PromptTemplate != want {
+			t.Errorf("PromptTemplate = %q, want %q", a.PromptTemplate, want)
+		}
+		return
+	}
+	t.Fatalf("imported rig agent fixture/superpowers.code-reviewer not found: %+v", explicitAgents(cfg.Agents))
+}
+
+func TestImport_CityImportUnscopedControlDispatcherExpandsPerRig(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	importDir := filepath.Join(dir, "core")
+	mustMkdirAll(t, cityDir, 0o755)
+	mustMkdirAll(t, importDir, 0o755)
+
+	writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+
+[imports.core]
+source = "../core"
+
+[[rigs]]
+name = "fixture"
+path = "/tmp/fixture"
+`)
+	writeTestFile(t, importDir, "pack.toml", `
+[pack]
+name = "core"
+schema = 2
+`)
+	writeTestFile(t, filepath.Join(importDir, "agents", "control-dispatcher"), "agent.toml", `
+start_command = "gc convoy control --serve --follow {{.Agent}}"
+prompt_mode = "none"
+process_names = ["gc"]
+max_active_sessions = 1
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	found := map[string]Agent{}
+	for _, a := range explicitAgents(cfg.Agents) {
+		found[a.QualifiedName()] = a
+	}
+	if _, ok := found["core.control-dispatcher"]; !ok {
+		t.Fatalf("missing city control dispatcher; agents=%v", found)
+	}
+	rigAgent, ok := found["fixture/core.control-dispatcher"]
+	if !ok {
+		t.Fatalf("missing rig control dispatcher; agents=%v", found)
+	}
+	if rigAgent.BindingName != "core" {
+		t.Errorf("BindingName = %q, want core", rigAgent.BindingName)
+	}
+	if rigAgent.Dir != "fixture" {
+		t.Errorf("Dir = %q, want fixture", rigAgent.Dir)
+	}
+	if rigAgent.MaxActiveSessions == nil || *rigAgent.MaxActiveSessions != 1 {
+		t.Errorf("MaxActiveSessions = %v, want 1", rigAgent.MaxActiveSessions)
+	}
+}
+
+func TestImport_CityImportRigExpansionRequalifiesDependsOn(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	importDir := filepath.Join(dir, "core")
+	mustMkdirAll(t, cityDir, 0o755)
+	mustMkdirAll(t, importDir, 0o755)
+
+	writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+
+[imports.core]
+source = "../core"
+
+[[rigs]]
+name = "fixture"
+path = "/tmp/fixture"
+`)
+	writeTestFile(t, importDir, "pack.toml", `
+[pack]
+name = "core"
+schema = 2
+`)
+	writeTestFile(t, filepath.Join(importDir, "agents", "worker"), "agent.toml", `
+depends_on = ["db"]
+start_command = "true"
+`)
+	writeTestFile(t, filepath.Join(importDir, "agents", "db"), "agent.toml", `
+start_command = "true"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	found := map[string]Agent{}
+	for _, a := range explicitAgents(cfg.Agents) {
+		found[a.QualifiedName()] = a
+	}
+	rigWorker, ok := found["fixture/core.worker"]
+	if !ok {
+		t.Fatalf("missing rig worker; agents=%v", found)
+	}
+	if got, want := rigWorker.DependsOn, []string{"fixture/core.db"}; len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("rig worker DependsOn = %v, want %v", got, want)
+	}
+}
+
+// TestImport_CityImportRigExpansionRequalifiesDependsOnPerRig guards against the
+// shared-backing-array aliasing bug: a city-imported unscoped agent expanded
+// across multiple rigs must get each rig's own DependsOn prefix, and the
+// city-scoped copy must stay unprefixed. The previous in-place qualification
+// mutated the range-copy's shared slice, poisoning the city copy and locking
+// the first rig's prefix onto every later rig.
+func TestImport_CityImportRigExpansionRequalifiesDependsOnPerRig(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	importDir := filepath.Join(dir, "core")
+	mustMkdirAll(t, cityDir, 0o755)
+	mustMkdirAll(t, importDir, 0o755)
+
+	writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+
+[imports.core]
+source = "../core"
+
+[[rigs]]
+name = "alpha"
+path = "/tmp/alpha"
+
+[[rigs]]
+name = "beta"
+path = "/tmp/beta"
+`)
+	writeTestFile(t, importDir, "pack.toml", `
+[pack]
+name = "core"
+schema = 2
+`)
+	writeTestFile(t, filepath.Join(importDir, "agents", "worker"), "agent.toml", `
+depends_on = ["db"]
+start_command = "true"
+`)
+	writeTestFile(t, filepath.Join(importDir, "agents", "db"), "agent.toml", `
+start_command = "true"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	found := map[string]Agent{}
+	for _, a := range explicitAgents(cfg.Agents) {
+		found[a.QualifiedName()] = a
+	}
+
+	for _, rig := range []string{"alpha", "beta"} {
+		worker, ok := found[rig+"/core.worker"]
+		if !ok {
+			t.Fatalf("missing rig worker %s/core.worker; agents=%v", rig, found)
+		}
+		if got, want := worker.DependsOn, []string{rig + "/core.db"}; len(got) != 1 || got[0] != want[0] {
+			t.Fatalf("rig %s worker DependsOn = %v, want %v", rig, got, want)
+		}
+	}
+
+	cityWorker, ok := found["core.worker"]
+	if !ok {
+		t.Fatalf("missing city-scoped core.worker; agents=%v", found)
+	}
+	if len(cityWorker.DependsOn) != 1 {
+		t.Fatalf("city worker DependsOn = %v, want one entry", cityWorker.DependsOn)
+	}
+	if dep := cityWorker.DependsOn[0]; strings.Contains(dep, "/") {
+		t.Fatalf("city worker DependsOn = %q, want no rig prefix", dep)
+	}
 }
 
 func TestImport_BindingNameStamped(t *testing.T) {
@@ -616,13 +937,13 @@ func TestImport_RootPackRemoteImportFromLockfileCache(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := filepath.Join(dir, "city")
 	mustMkdirAll(t, cityDir, 0o755)
 
 	source := "https://github.com/example/gastown.git"
-	commit := "abc123def456"
-	stubCleanRepoCacheGit(t, commit)
+	commit := stubCleanRepoCacheGit(t)
 	cacheKey := fmt.Sprintf("%x", sha256.Sum256([]byte(source+commit)))
 	cacheDir := filepath.Join(home, ".gc", "cache", "repos", cacheKey)
 	mustMkdirAll(t, filepath.Join(cacheDir, ".git"), 0o755)
@@ -677,6 +998,7 @@ func TestImport_RootPackRemoteImportDirtySharedCacheFails(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := filepath.Join(dir, "city")
 	mustMkdirAll(t, cityDir, 0o755)
@@ -755,6 +1077,7 @@ func TestImport_RootPackRemoteImportMissingSharedCacheFails(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := filepath.Join(dir, "city")
 	mustMkdirAll(t, cityDir, 0o755)
@@ -794,6 +1117,7 @@ func TestImport_RootPackRemoteImportMissingCacheHeadFails(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := filepath.Join(dir, "city")
 	mustMkdirAll(t, cityDir, 0o755)
@@ -864,6 +1188,7 @@ func TestImport_RootPackRemoteImportMissingLockfileSuggestsInstall(t *testing.T)
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := filepath.Join(dir, "city")
 	mustMkdirAll(t, cityDir, 0o755)
@@ -895,12 +1220,12 @@ func TestImport_RootPackRemoteSubpathImportFromLockfileCache(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := filepath.Join(dir, "city")
 	mustMkdirAll(t, cityDir, 0o755)
 
-	commit := "abc123def456"
-	stubCleanRepoCacheGit(t, commit)
+	commit := stubCleanRepoCacheGit(t)
 	cacheKey := fmt.Sprintf("%x", sha256.Sum256([]byte("file:///tmp/repo.git"+commit)))
 	cacheDir := filepath.Join(home, ".gc", "cache", "repos", cacheKey)
 	mustMkdirAll(t, filepath.Join(cacheDir, ".git"), 0o755)
@@ -956,12 +1281,12 @@ func TestImport_RootPackGitHubTreeImportFromLockfileCache(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
 	cityDir := filepath.Join(dir, "city")
 	mustMkdirAll(t, cityDir, 0o755)
 
-	commit := "abc123def456"
-	stubCleanRepoCacheGit(t, commit)
+	commit := stubCleanRepoCacheGit(t)
 	cacheKey := fmt.Sprintf("%x", sha256.Sum256([]byte("https://github.com/example/repo.git"+commit)))
 	cacheDir := filepath.Join(home, ".gc", "cache", "repos", cacheKey)
 	mustMkdirAll(t, filepath.Join(cacheDir, ".git"), 0o755)
@@ -1009,6 +1334,52 @@ scope = "city"
 	}
 	if !found["base.scout"] {
 		t.Errorf("missing base.scout; got: %v", found)
+	}
+}
+
+func TestResolvedPackNamesResolvesGitHubTreeImportsFromLockfileCache(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
+
+	cityDir := filepath.Join(dir, "city")
+	mustMkdirAll(t, cityDir, 0o755)
+
+	source := "https://github.com/example/repo/tree/main/gastown"
+	commit := stubCleanRepoCacheGit(t)
+	cacheDir := filepath.Join(home, ".gc", "cache", "repos", RepoCacheKey(source, commit))
+	mustMkdirAll(t, filepath.Join(cacheDir, ".git"), 0o755)
+	writeTestFile(t, cityDir, "packs.lock", fmt.Sprintf(`
+schema = 1
+
+[packs.%q]
+version = "1.2.3"
+commit = %q
+fetched = "2026-04-10T00:00:00Z"
+`, source, commit))
+	writeTestFile(t, filepath.Join(cacheDir, "gastown"), "pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[imports.maintenance]
+source = "../maintenance"
+`)
+	writeTestFile(t, filepath.Join(cacheDir, "maintenance"), "pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+
+	names := mustResolvedPackNames(t, nil, map[string]Import{
+		"gastown": {Source: source, Version: "^1.2"},
+	}, fsys.OSFS{}, cityDir)
+
+	for _, name := range []string{"gastown", "maintenance"} {
+		if !names[name] {
+			t.Fatalf("resolved pack names = %#v, missing %q", names, name)
+		}
 	}
 }
 
@@ -2044,7 +2415,7 @@ session_live = ["echo global"]
 	cache := &packLoadCache{results: map[string]*packLoadResult{}}
 	topoPath := filepath.Join(packDir, "pack.toml")
 
-	agents, namedSessions, providers, services, topoDirs, requires, globals, err := loadPackWithCache(
+	agents, namedSessions, providers, _, services, topoDirs, requires, globals, err := loadPackWithCache(
 		fsys.OSFS{}, topoPath, packDir, cityRoot, "", nil, cache)
 	if err != nil {
 		t.Fatalf("loadPackWithCache first pass: %v", err)
@@ -2064,7 +2435,7 @@ session_live = ["echo global"]
 	services[0].Process.Command[0] = "mutated"
 	globals[0].SessionLive[0] = "mutated"
 
-	agents2, namedSessions2, providers2, services2, topoDirs2, requires2, globals2, err := loadPackWithCache(
+	agents2, namedSessions2, providers2, _, services2, topoDirs2, requires2, globals2, err := loadPackWithCache(
 		fsys.OSFS{}, topoPath, packDir, cityRoot, "", nil, cache)
 	if err != nil {
 		t.Fatalf("loadPackWithCache second pass: %v", err)

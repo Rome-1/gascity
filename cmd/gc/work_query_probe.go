@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/shellquote"
@@ -143,12 +144,27 @@ func prefixedWorkQueryForProbeWithEnv(
 	if agentCfg == nil {
 		return ""
 	}
-	command := strings.TrimSpace(agentCfg.EffectiveWorkQuery())
+	beadsCfg := config.BeadsConfig{}
+	var rigs []config.Rig
+	if cfg != nil {
+		beadsCfg = cfg.Beads
+		rigs = cfg.Rigs
+	}
+	// Controller-owned: config.QueryTopology{Beads: ...} and NOT
+	// cityQueryTopology. Resolving the federation fact means asking the
+	// storage routes, and the one-shot funnel that answers for a CLI command
+	// (cliStorageRoutes) is explicitly for the half of the program that
+	// "never builds a CityRuntime" — a controller reaching it would open the
+	// city's binding a second time in a process that already holds it open.
+	// The controller's own routes are the right source; threading them into
+	// this plumbing is a change to controller wiring, not part of swapping
+	// the reader, so it stays with the claim-routing slice (ga-601v2).
+	command := strings.TrimSpace(agentCfg.EffectiveWorkQueryFor(config.QueryTopology{Beads: beadsCfg}))
 	// Expand {{.Rig}}/{{.AgentBase}} so rig-scoped agents probe with
 	// rig-specific metadata. Mirrors the scale_check expansion in
 	// build_desired_state.go; #793. Malformed templates are logged to
 	// stderr (when supplied) and fall back to the raw command.
-	command = expandAgentCommandTemplate(cityPath, cityName, agentCfg, cfg.Rigs, "work_query", command, stderr)
+	command = expandAgentCommandTemplate(cityPath, cityName, agentCfg, rigs, "work_query", command, stderr)
 	if command == "" || agentCfg.SupportsMultipleSessions() {
 		return prefixShellEnv(queryEnv, command)
 	}
@@ -162,7 +178,7 @@ func prefixedWorkQueryForProbeWithEnv(
 	}
 	env["GC_AGENT"] = agentCfg.QualifiedName()
 	env["GC_SESSION_NAME"] = sessionName
-	env["GC_TEMPLATE"] = agentCfg.QualifiedName()
+	env["GC_TEMPLATE"] = agentutil.RoutedToIdentity(agentCfg)
 	return prefixShellEnv(env, command)
 }
 
@@ -180,8 +196,8 @@ func probeSessionNameForTemplate(
 	if cfg != nil {
 		if spec, ok := findNamedSessionSpec(cfg, cityName, identity); ok {
 			if sessionBeads != nil {
-				if bead, ok := findCanonicalNamedSessionBead(sessionBeads, spec); ok {
-					if sn := strings.TrimSpace(bead.Metadata["session_name"]); sn != "" {
+				if info, ok := findCanonicalNamedSessionInfo(sessionBeads, spec); ok {
+					if sn := strings.TrimSpace(info.SessionNameMetadata); sn != "" {
 						return sn
 					}
 				}

@@ -21,6 +21,24 @@ func writeFile(t *testing.T, dir, name, content string) {
 	}
 }
 
+type readCountingFS struct {
+	fsys.OSFS
+	reads map[string]int
+}
+
+func newReadCountingFS() *readCountingFS {
+	return &readCountingFS{reads: make(map[string]int)}
+}
+
+func (f *readCountingFS) ReadFile(name string) ([]byte, error) {
+	f.reads[filepath.Clean(name)]++
+	return f.OSFS.ReadFile(name)
+}
+
+func (f *readCountingFS) ReadCount(name string) int {
+	return f.reads[filepath.Clean(name)]
+}
+
 func TestExpandPacks_Basic(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/gastown/pack.toml", `
@@ -430,6 +448,83 @@ scope = "rig"
 	}
 	if refinery.Suspended {
 		t.Errorf("refinery.Suspended = true, want false (rig patch should win after city patch)")
+	}
+}
+
+// TestLoadWithIncludes_WildcardPatchKeepsCityBeforeRigPrecedence is the
+// regression for the wildcard partitioning bug: a city-level rig="*" patch
+// whose Name also matches an implicit provider-derived agent used to be fully
+// deferred until AFTER rig overrides ran, so it clobbered the rig override and
+// reversed city-before-rig precedence.
+//
+// The agent is named "claude" — the same name as the provider — so it is BOTH
+// an already-present rig-pack agent (proj/gs.claude) AND an implicit-agent name.
+// The wildcard patch must apply in the normal city patch phase (so the rig
+// override, applied later, still wins on the field they share) while ALSO
+// deferring to the injected implicit-agent tail. Assertions: the wildcard ran
+// (it set Nudge, which the rig override does not touch) AND the rig override
+// won (Suspended=false, set after the wildcard's Suspended=true).
+func TestLoadWithIncludes_WildcardPatchKeepsCityBeforeRigPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test"
+
+[providers.claude]
+base = "builtin:claude"
+
+[[rigs]]
+name = "proj"
+path = "/tmp/proj"
+
+[rigs.imports.gs]
+source = "./packs/gastown"
+
+[[rigs.patches]]
+agent = "claude"
+suspended = false
+
+[[patches.agent]]
+name = "claude"
+rig = "*"
+suspended = true
+nudge = "city wildcard applied"
+`)
+	writeFile(t, dir, "packs/gastown/pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[[agent]]
+name = "claude"
+provider = "claude"
+scope = "rig"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	var claude *Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].QualifiedName() == "proj/gs.claude" {
+			claude = &cfg.Agents[i]
+			break
+		}
+	}
+	if claude == nil {
+		names := make([]string, 0, len(cfg.Agents))
+		for _, a := range cfg.Agents {
+			names = append(names, a.QualifiedName())
+		}
+		t.Fatalf("agent proj/gs.claude not found in merged config; agents: %v", names)
+	}
+	if claude.Nudge != "city wildcard applied" {
+		t.Errorf("claude.Nudge = %q, want city wildcard patch to apply in the normal city phase", claude.Nudge)
+	}
+	if claude.Suspended {
+		t.Errorf("claude.Suspended = true, want false (rig override must win after the city wildcard)")
 	}
 }
 
@@ -928,6 +1023,81 @@ func TestPackContentHashRecursive(t *testing.T) {
 	}
 }
 
+func TestPackContentHashRecursiveCachesUnchangedTree(t *testing.T) {
+	ResetPackContentHashCache()
+	t.Cleanup(ResetPackContentHashCache)
+
+	dir := t.TempDir()
+	writeFile(t, dir, "pack.toml", `name = "p"`)
+	writeFile(t, dir, "prompts/a.md", "prompt a")
+	writeFile(t, dir, "assets/big.txt", strings.Repeat("x", 4096))
+
+	cfs := newReadCountingFS()
+	bigPath := filepath.Join(dir, "assets/big.txt")
+
+	h1 := PackContentHashRecursive(cfs, dir)
+	if cfs.ReadCount(bigPath) == 0 {
+		t.Fatal("first hash should read file content")
+	}
+
+	// Second call on the unchanged tree: cache hit, zero additional content reads.
+	before := cfs.ReadCount(bigPath)
+	h2 := PackContentHashRecursive(cfs, dir)
+	if h2 != h1 {
+		t.Fatalf("cached hash mismatch: %q vs %q", h1, h2)
+	}
+	if after := cfs.ReadCount(bigPath); after != before {
+		t.Fatalf("cache hit re-read content (%d→%d), want no new reads (stat fingerprint should gate)", before, after)
+	}
+
+	// Mutating a file bumps its mtime/size → fingerprint changes → re-read + new hash.
+	writeFile(t, dir, "prompts/a.md", "prompt a (edited, longer)")
+	beforeChange := cfs.ReadCount(bigPath)
+	h3 := PackContentHashRecursive(cfs, dir)
+	if h3 == h1 {
+		t.Fatal("hash should change after content change")
+	}
+	if cfs.ReadCount(bigPath) == beforeChange {
+		t.Fatal("changed tree should be re-read, not served from cache")
+	}
+}
+
+// TestPackContentHashRecursiveDetectsMtimePreservingEdit reproduces ga-b675vk:
+// mtime-preserving deploy tooling (cp -p, rsync --checksum --times) can edit
+// file content without changing size or mtime, which previously let a stale
+// hash survive in the cache. ctime cannot be rolled back by any standard
+// syscall, so it must break the tie.
+func TestPackContentHashRecursiveDetectsMtimePreservingEdit(t *testing.T) {
+	ResetPackContentHashCache()
+	t.Cleanup(ResetPackContentHashCache)
+
+	dir := "/pack"
+	path := filepath.Join(dir, "pack.toml")
+	fs := fsys.NewFake()
+	fs.Dirs[dir] = true
+
+	if err := fs.WriteFile(path, []byte("name = \"a\""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h1 := PackContentHashRecursive(fs, dir)
+	origModTime := fs.ModTimes[path]
+
+	// Same size (10 bytes), different content, then mtime forced back to its
+	// original value — simulating tooling that preserves mtime across a
+	// content-changing write. ctime is deliberately left alone: Fake advances
+	// it on every WriteFile and never lets a test roll it back, mirroring the
+	// real kernel where no userspace syscall sets ctime.
+	if err := fs.WriteFile(path, []byte("name = \"b\""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fs.ModTimes[path] = origModTime
+
+	h2 := PackContentHashRecursive(fs, dir)
+	if h2 == h1 {
+		t.Fatal("hash should change when content changes even though size and mtime match the cached fingerprint exactly (ctime must break the tie)")
+	}
+}
+
 func TestPackContentHashRecursiveIgnoresRuntimeDirs(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "pack.toml", "test")
@@ -942,6 +1112,13 @@ func TestPackContentHashRecursiveIgnoresRuntimeDirs(t *testing.T) {
 	writeFile(t, dir, ".cache/tool/result.json", `{"cached":true}`)
 	writeFile(t, dir, ".git/HEAD", "ref: refs/heads/main")
 	writeFile(t, dir, "nested/__pycache__/helper.pyc", "compiled")
+	// gastownhall/gascity#2954: node_modules at any depth must be skipped.
+	// Packs anchored at monorepo roots previously dragged tens of thousands
+	// of node_modules files through the supervisor on every dirty reload.
+	writeFile(t, dir, "node_modules/.package-lock.json", `{"name":"x"}`)
+	writeFile(t, dir, "node_modules/lodash/index.js", "module.exports = {}")
+	writeFile(t, dir, "packages/foo/node_modules/lodash/index.js", "module.exports = {}")
+	writeFile(t, dir, "apps/bar/node_modules/.bun/install-cache.bin", "binary")
 	h2 := PackContentHashRecursive(fsys.OSFS{}, dir)
 	if h2 != h1 {
 		t.Fatalf("hash changed after runtime output writes: %q vs %q", h1, h2)
@@ -1016,6 +1193,115 @@ includes = ["packs/gt"]
 	} else if !strings.Contains(src, "pack.toml") {
 		t.Errorf("witness provenance = %q, want to contain pack.toml", src)
 	}
+}
+
+func TestLoadWithIncludes_PackAgentDefaultsProviderAppliesToIncludedAgent(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/gt/pack.toml", `
+[pack]
+name = "gastown"
+version = "1.0.0"
+schema = 1
+
+[providers.claude]
+base = "builtin:claude"
+
+[providers.codex]
+base = "builtin:codex"
+
+[agent_defaults]
+provider = "codex"
+
+[[agent]]
+name = "worker"
+
+[[agent]]
+name = "reviewer"
+provider = "claude"
+`)
+
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test-city"
+provider = "gemini"
+includes = ["packs/gt"]
+
+[providers.gemini]
+base = "builtin:gemini"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	var worker, reviewer *Agent
+	for i := range cfg.Agents {
+		switch cfg.Agents[i].QualifiedName() {
+		case "worker":
+			worker = &cfg.Agents[i]
+		case "reviewer":
+			reviewer = &cfg.Agents[i]
+		}
+	}
+	if worker == nil || reviewer == nil {
+		t.Fatalf("expected worker and reviewer, got worker=%v reviewer=%v", worker != nil, reviewer != nil)
+	}
+	if got := worker.Provider; got != "codex" {
+		t.Fatalf("worker Provider = %q, want pack default codex", got)
+	}
+	if got := reviewer.Provider; got != "claude" {
+		t.Fatalf("reviewer Provider = %q, want explicit claude", got)
+	}
+}
+
+func TestLoadWithIncludes_CityAgentDefaultsProviderOverridesIncludedPackDefault(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/gt/pack.toml", `
+[pack]
+name = "gastown"
+version = "1.0.0"
+schema = 1
+
+[providers.codex]
+base = "builtin:codex"
+
+[agent_defaults]
+provider = "codex"
+
+[[agent]]
+name = "worker"
+`)
+
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test-city"
+includes = ["packs/gt"]
+
+[agent_defaults]
+provider = "gemini"
+
+[providers.gemini]
+base = "builtin:gemini"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	for _, a := range cfg.Agents {
+		if a.QualifiedName() != "worker" {
+			continue
+		}
+		if got := a.Provider; got != "gemini" {
+			t.Fatalf("worker Provider = %q, want city default gemini", got)
+		}
+		return
+	}
+	t.Fatal("worker agent not found")
 }
 
 func TestExpandPacks_OverrideEnv(t *testing.T) {
@@ -1175,8 +1461,14 @@ func TestHasPackRigs(t *testing.T) {
 	if HasPackRigs(nil) {
 		t.Error("nil rigs should return false")
 	}
-	if HasPackRigs([]Rig{{Name: "a", Path: "/a"}}) {
-		t.Error("rig without pack should return false")
+	if HasPackRigs([]Rig{{Name: "a"}}) {
+		t.Error("rig with no path and no includes should return false")
+	}
+	// A rig with only a path is treated as potentially having a pack (expandPacks
+	// will discover the root pack.toml if present). This enables the packV2
+	// convention where a rig root carries agents/ directories directly.
+	if !HasPackRigs([]Rig{{Name: "a", Path: "/a"}}) {
+		t.Error("rig with path should return true (may have root pack.toml)")
 	}
 	if !HasPackRigs([]Rig{{Name: "a", Path: "/a", Includes: []string{"topo"}}}) {
 		t.Error("rig with includes should return true")
@@ -2289,7 +2581,7 @@ includes = ["../maintenance"]
 name = "mayor"
 `)
 
-	agents, _, _, _, _, _, _, err := loadPack(
+	agents, _, _, _, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/gastown/pack.toml"),
 		filepath.Join(dir, "packs/gastown"),
@@ -2336,7 +2628,7 @@ name = "mayor"
 scope = "city"
 `)
 
-	agents, _, _, _, _, _, _, err := loadPack(
+	agents, _, _, _, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/gastown/pack.toml"),
 		filepath.Join(dir, "packs/gastown"),
@@ -2484,7 +2776,7 @@ name = "mayor"
 `)
 	writeFile(t, dir, "packs/gastown/formulas/.keep", "")
 
-	_, _, _, _, topoDirs, _, _, err := loadPack(
+	_, _, _, _, _, topoDirs, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/gastown/pack.toml"),
 		filepath.Join(dir, "packs/gastown"),
@@ -2528,7 +2820,7 @@ includes = ["../a"]
 name = "beta"
 `)
 
-	_, _, _, _, _, _, _, err := loadPack(
+	_, _, _, _, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/a/pack.toml"),
 		filepath.Join(dir, "packs/a"),
@@ -2554,7 +2846,7 @@ includes = ["../nonexistent"]
 name = "alpha"
 `)
 
-	_, _, _, _, _, _, _, err := loadPack(
+	_, _, _, _, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/main/pack.toml"),
 		filepath.Join(dir, "packs/main"),
@@ -2597,7 +2889,7 @@ command = "main-claude"
 name = "boss"
 `)
 
-	_, _, providers, _, _, _, _, err := loadPack(
+	_, _, providers, _, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/main/pack.toml"),
 		filepath.Join(dir, "packs/main"),
@@ -2740,7 +3032,7 @@ name = "polecat"
 scope = "rig"
 `)
 
-	agents, _, _, _, _, _, _, err := loadPack(
+	agents, _, _, _, _, _, _, _, err := loadPack(
 		fsys.OSFS{}, filepath.Join(dir, "packs/test/pack.toml"),
 		filepath.Join(dir, "packs/test"), dir, "myrig", nil)
 	if err != nil {
@@ -3204,7 +3496,7 @@ source = "../shared"
 transitive = false
 `)
 
-	names := resolvedPackNames([]string{"packs/wrapper"}, map[string]Import{
+	names := mustResolvedPackNames(t, []string{"packs/wrapper"}, map[string]Import{
 		"shared": {Source: "packs/shared"},
 	}, fsys.OSFS{}, dir)
 
@@ -3231,7 +3523,7 @@ source = "../maintenance"
 `)
 
 	transitiveFalse := false
-	names := resolvedPackNames(nil, map[string]Import{
+	names := mustResolvedPackNames(t, nil, map[string]Import{
 		"shared": {Source: "packs/shared", Transitive: &transitiveFalse},
 	}, fsys.OSFS{}, dir)
 
@@ -3269,7 +3561,7 @@ source = "../middle"
 transitive = false
 `)
 
-	names := resolvedPackNames([]string{"packs/root"}, nil, fsys.OSFS{}, dir)
+	names := mustResolvedPackNames(t, []string{"packs/root"}, nil, fsys.OSFS{}, dir)
 	if !names["middle"] {
 		t.Fatalf("middle pack was not recorded: names=%v", names)
 	}
@@ -3316,11 +3608,86 @@ source = "../middle"
 		{"packs/shallow", "packs/deep"},
 		{"packs/deep", "packs/shallow"},
 	} {
-		names := resolvedPackNames(includes, nil, fsys.OSFS{}, dir)
+		names := mustResolvedPackNames(t, includes, nil, fsys.OSFS{}, dir)
 		if !names["maintenance"] {
 			t.Fatalf("includes %v did not resolve transitive maintenance after shallow visit: names=%v", includes, names)
 		}
 	}
+}
+
+func TestResolvedPackNames_AvoidsRedundantPackReads(t *testing.T) {
+	t.Run("repeated shallow imports", func(t *testing.T) {
+		dir := t.TempDir()
+
+		writeFile(t, dir, "packs/shared/pack.toml", `
+[pack]
+name = "shared"
+schema = 2
+`)
+
+		transitiveFalse := false
+		countingFS := newReadCountingFS()
+		names := mustResolvedPackNames(t, nil, map[string]Import{
+			"shared_a": {Source: "packs/shared", Transitive: &transitiveFalse},
+			"shared_b": {Source: "packs/shared", Transitive: &transitiveFalse},
+		}, countingFS, dir)
+
+		if !names["shared"] {
+			t.Fatalf("shared missing from repeated shallow imports: names=%v", names)
+		}
+		if got := countingFS.ReadCount(filepath.Join(dir, "packs/shared/pack.toml")); got != 1 {
+			t.Fatalf("shared pack.toml read count = %d, want 1", got)
+		}
+	})
+
+	t.Run("diamond transitive imports", func(t *testing.T) {
+		dir := t.TempDir()
+
+		writeFile(t, dir, "packs/shared/pack.toml", `
+[pack]
+name = "shared"
+schema = 2
+`)
+		writeFile(t, dir, "packs/left/pack.toml", `
+[pack]
+name = "left"
+schema = 2
+
+[imports.shared]
+source = "../shared"
+`)
+		writeFile(t, dir, "packs/right/pack.toml", `
+[pack]
+name = "right"
+schema = 2
+
+[imports.shared]
+source = "../shared"
+`)
+		writeFile(t, dir, "packs/root/pack.toml", `
+[pack]
+name = "root"
+schema = 2
+
+[imports.left]
+source = "../left"
+
+[imports.right]
+source = "../right"
+`)
+
+		countingFS := newReadCountingFS()
+		names := mustResolvedPackNames(t, []string{"packs/root"}, nil, countingFS, dir)
+
+		for _, name := range []string{"root", "left", "right", "shared"} {
+			if !names[name] {
+				t.Fatalf("%s missing from diamond imports: names=%v", name, names)
+			}
+		}
+		if got := countingFS.ReadCount(filepath.Join(dir, "packs/shared/pack.toml")); got != 1 {
+			t.Fatalf("shared pack.toml read count = %d, want 1", got)
+		}
+	})
 }
 
 // agentNamesOf is a small test helper for readable failure messages.
@@ -3618,114 +3985,14 @@ agent = ""
 }
 
 // ---------------------------------------------------------------------------
-// Fallback agent tests
+// Pack agent collision tests
 // ---------------------------------------------------------------------------
+// The fallback-agent mechanism was removed: packs own their agents under
+// unambiguous names and cross-pack duplicates are hard errors. A stale
+// `fallback` key in a V2 agents/<name>/agent.toml is ignored; in a V1
+// inline [[agent]] it fails the pack's unknown-key gate.
 
-func TestFallbackAgent_NonFallbackWins(t *testing.T) {
-	// Non-fallback dog from pack A, fallback dog from pack B.
-	// Only A's dog should survive.
-	dir := t.TempDir()
-	writeFile(t, dir, "packs/maintenance/pack.toml", `
-[pack]
-name = "maintenance"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-nudge = "full dog"
-`)
-	writeFile(t, dir, "packs/dolt/pack.toml", `
-[pack]
-name = "dolt"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-fallback = true
-nudge = "fallback dog"
-`)
-
-	cfg := &City{
-		Workspace: Workspace{
-			Includes: []string{"packs/maintenance", "packs/dolt"},
-		},
-	}
-
-	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
-	if err != nil {
-		t.Fatalf("ExpandCityPacks: %v", err)
-	}
-
-	// Only the non-fallback dog should remain.
-	var dogs []Agent
-	for _, a := range cfg.Agents {
-		if a.Name == "dog" {
-			dogs = append(dogs, a)
-		}
-	}
-	if len(dogs) != 1 {
-		t.Fatalf("got %d dogs, want 1", len(dogs))
-	}
-	if dogs[0].Nudge != "full dog" {
-		t.Errorf("surviving dog nudge = %q, want %q", dogs[0].Nudge, "full dog")
-	}
-}
-
-func TestFallbackAgent_BothFallback_FirstWins(t *testing.T) {
-	// Two fallback dogs from different packs. First loaded wins.
-	dir := t.TempDir()
-	writeFile(t, dir, "packs/alpha/pack.toml", `
-[pack]
-name = "alpha"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-fallback = true
-nudge = "alpha dog"
-`)
-	writeFile(t, dir, "packs/beta/pack.toml", `
-[pack]
-name = "beta"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-fallback = true
-nudge = "beta dog"
-`)
-
-	cfg := &City{
-		Workspace: Workspace{
-			Includes: []string{"packs/alpha", "packs/beta"},
-		},
-	}
-
-	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
-	if err != nil {
-		t.Fatalf("ExpandCityPacks: %v", err)
-	}
-
-	var dogs []Agent
-	for _, a := range cfg.Agents {
-		if a.Name == "dog" {
-			dogs = append(dogs, a)
-		}
-	}
-	if len(dogs) != 1 {
-		t.Fatalf("got %d dogs, want 1", len(dogs))
-	}
-	if dogs[0].Nudge != "alpha dog" {
-		t.Errorf("surviving dog nudge = %q, want %q (first loaded wins)", dogs[0].Nudge, "alpha dog")
-	}
-}
-
-func TestFallbackAgent_NeitherFallback_CollisionError(t *testing.T) {
-	// Two non-fallback dogs from different packs. Should still error.
+func TestPackAgents_DuplicateAcrossPacksErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/alpha/pack.toml", `
 [pack]
@@ -3754,26 +4021,26 @@ scope = "city"
 
 	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err == nil {
-		t.Fatal("expected collision error for two non-fallback dogs")
+		t.Fatal("expected collision error for two dogs from different packs")
 	}
 	if !strings.Contains(err.Error(), "duplicate agent") {
 		t.Errorf("error = %q, want 'duplicate agent'", err.Error())
 	}
 }
 
-func TestFallbackAgent_StandaloneWorks(t *testing.T) {
-	// Single fallback agent, no collision — should be kept normally.
+func TestPackAgents_StaleFallbackKeyInAgentTomlIgnored(t *testing.T) {
+	// The removed `fallback` key in a V2 agent.toml must not break loading;
+	// the agent is kept as a normal definition.
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/health/pack.toml", `
 [pack]
 name = "health"
-schema = 1
-
-[[agent]]
-name = "dog"
+schema = 2
+`)
+	writeFile(t, dir, "packs/health/agents/dog/agent.toml", `
 scope = "city"
 fallback = true
-nudge = "standalone fallback"
+nudge = "standalone dog"
 `)
 
 	cfg := &City{
@@ -3790,9 +4057,6 @@ nudge = "standalone fallback"
 	}
 	if cfg.Agents[0].Name != "dog" {
 		t.Errorf("agent name = %q, want dog", cfg.Agents[0].Name)
-	}
-	if !cfg.Agents[0].Fallback {
-		t.Error("agent should have Fallback = true")
 	}
 }
 
@@ -5138,4 +5402,105 @@ func TestMergeHoistedCityNamedSessions_DedupAcrossBindings(t *testing.T) {
 	if merged[0].BindingName != "gastown" {
 		t.Errorf("first-occurrence-wins: BindingName = %q, want %q", merged[0].BindingName, "gastown")
 	}
+}
+
+func TestCachedPackField(t *testing.T) {
+	dir := t.TempDir()
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := &packLoadCache{results: map[string]*packLoadResult{
+		abs: {warnings: []string{"w1", "w2"}},
+	}}
+
+	get := func(r *packLoadResult) []string { return append([]string(nil), r.warnings...) }
+
+	t.Run("nil cache returns zero value", func(t *testing.T) {
+		if got := cachedPackField(nil, dir, get); got != nil {
+			t.Errorf("cachedPackField(nil) = %v, want nil", got)
+		}
+	})
+
+	t.Run("cache miss returns zero value", func(t *testing.T) {
+		if got := cachedPackField(cache, filepath.Join(dir, "missing"), get); got != nil {
+			t.Errorf("cachedPackField(miss) = %v, want nil", got)
+		}
+	})
+
+	t.Run("cache hit resolves relative path and runs get", func(t *testing.T) {
+		got := cachedPackField(cache, dir, get)
+		if len(got) != 2 || got[0] != "w1" || got[1] != "w2" {
+			t.Errorf("cachedPackField(hit) = %v, want [w1 w2]", got)
+		}
+	})
+
+	t.Run("get closure copies on read", func(t *testing.T) {
+		got := cachedPackField(cache, dir, get)
+		got[0] = "mutated"
+		if cache.results[abs].warnings[0] != "w1" {
+			t.Errorf("get closure did not copy: cache mutated to %q", cache.results[abs].warnings[0])
+		}
+	})
+}
+
+// TestLoadPackForLint_WarnsWhenAgentDefaultsUnusedByImports is the
+// end-to-end regression for #4524: a pack's [agent_defaults] never applies
+// to agents brought in by the pack's own [imports.*]. This confirms the
+// warning actually surfaces through the real pack-load path, not just the
+// pure warnUnusedPackAgentDefaultsForImports function in isolation.
+func TestLoadPackForLint_WarnsWhenAgentDefaultsUnusedByImports(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/roles/pack.toml", `
+[pack]
+name = "roles"
+schema = 2
+
+[[agent]]
+name = "requirements-planner"
+`)
+
+	writeFile(t, dir, "packs/local/pack.toml", `
+[pack]
+name = "local"
+schema = 2
+
+[agent_defaults]
+provider = "cacc-sol"
+
+[imports.roles]
+source = "../roles"
+`)
+
+	loaded, err := LoadPackForLint(fsys.OSFS{}, filepath.Join(dir, "packs", "local"))
+	if err != nil {
+		t.Fatalf("LoadPackForLint: %v", err)
+	}
+	const wantSubstring = "does not apply to a pack's own [imports.*] agents"
+	found := false
+	for _, w := range loaded.Warnings {
+		if strings.Contains(w, wantSubstring) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %#v, want one containing %q", loaded.Warnings, wantSubstring)
+	}
+}
+
+// mustResolvedPackNames is resolvedPackNames for the blocking callers above.
+// They wait out contention, so the only error class they can hit is a new one
+// the walk grows later. Asserting that here keeps such an error from being
+// silently discarded and turning those assertions into claims about a
+// half-walked graph. The non-blocking mode has its own tests, which care about
+// the error rather than the names.
+func mustResolvedPackNames(t *testing.T, includes []string, imports map[string]Import, sysFS fsys.FS, cityRoot string) map[string]bool {
+	t.Helper()
+	names, err := resolvedPackNames(includes, imports, sysFS, cityRoot, false)
+	if err != nil {
+		t.Fatalf("resolvedPackNames: %v", err)
+	}
+	return names
 }

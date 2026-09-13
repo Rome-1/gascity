@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -26,11 +27,32 @@ type Store struct {
 	script  string
 	timeout time.Duration
 	env     map[string]string
+
+	// localMu and localStrings back SetLocalString/GetLocalString. Clone-local
+	// data is kept in process only, never routed through the script: unlike
+	// every other operation, it must not depend on script latency, since the
+	// whole point is cheap high-churn writes. It does not survive process
+	// restart, which is an accepted limitation for this delegating store.
+	localMu      sync.Mutex
+	localStrings map[string]map[string]string
 }
 
 // SetEnv sets environment variables passed to the script process.
 func (s *Store) SetEnv(env map[string]string) {
 	s.env = env
+}
+
+// IDPrefix returns the bead ID prefix for this exec-backed scope, taken from
+// the projected GC_BEADS_PREFIX env. NewCachingStore uses this to key the
+// per-scope cache (owner metadata); without it an exec-backed rig store caches
+// as "(no-prefix)" and the reconciler's rig-scoped scale-check cannot associate
+// routed rig beads with the rig pool, so a direct `gc sling <rig>/<agent>` never
+// scales a worker.
+func (s *Store) IDPrefix() string {
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.env["GC_BEADS_PREFIX"])
 }
 
 // NewStore returns a Store that delegates to the given script.
@@ -74,8 +96,9 @@ func stripExecEnvKey(key string) bool {
 // run executes the script with the given args, optionally piping stdinData
 // to its stdin. Returns the trimmed stdout on success.
 //
-// Exit code 2 is treated as success (unknown operation — forward compatible).
-// Any other non-zero exit code returns an error wrapping stderr.
+// Exit code 2 is treated as success for unknown operation names. When ready is
+// called with contract flags, exit code 2 means the invocation was rejected and
+// must surface as an error instead of silently returning empty data.
 func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
@@ -100,6 +123,13 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 2 {
+				if readyExit2IsRejectedInvocation(args) {
+					errMsg := strings.TrimSpace(stderr.String())
+					if errMsg == "" {
+						errMsg = err.Error()
+					}
+					return "", fmt.Errorf("exec beads %s %s: %s", s.script, strings.Join(args, " "), errMsg)
+				}
 				return "", nil
 			}
 		}
@@ -111,6 +141,10 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 	}
 
 	return strings.TrimRight(stdout.String(), "\n"), nil
+}
+
+func readyExit2IsRejectedInvocation(args []string) bool {
+	return len(args) > 1 && args[0] == "ready"
 }
 
 // isNotFoundError reports whether an error from the script indicates a
@@ -154,13 +188,18 @@ func (w *beadWire) toBead() beads.Bead {
 		cloned := *w.Priority
 		priority = &cloned
 	}
+	status := w.Status
+	if strings.TrimSpace(status) == "" {
+		status = "open"
+	}
 	return beads.Bead{
 		ID:          w.ID,
 		Title:       w.Title,
-		Status:      w.Status,
+		Status:      status,
 		Type:        w.Type,
 		Priority:    priority,
 		CreatedAt:   w.CreatedAt,
+		UpdatedAt:   w.UpdatedAt,
 		Assignee:    w.Assignee,
 		From:        w.From,
 		ParentID:    w.ParentID,
@@ -170,7 +209,17 @@ func (w *beadWire) toBead() beads.Bead {
 		Labels:      w.Labels,
 		Metadata:    coerceMetadata(w.Metadata),
 		Ephemeral:   w.Ephemeral,
+		NoHistory:   w.NoHistory,
+		DeferUntil:  cloneTimePtr(w.DeferUntil),
 	}
+}
+
+func cloneTimePtr(v *time.Time) *time.Time {
+	if v == nil {
+		return nil
+	}
+	cloned := *v
+	return &cloned
 }
 
 // coerceMetadata converts raw JSON metadata values to strings. Backing stores
@@ -244,7 +293,17 @@ func (s *Store) Update(id string, opts beads.UpdateOpts) error {
 	return nil
 }
 
-// Close sets a bead's status to "closed": script close <id>
+// Close sets a bead's status to "closed": script close <id>.
+//
+// This delegate stays bare (no --force). The exec: wrapper scripts
+// (contrib/beads-scripts/gc-beads-k8s, gc-beads-br) are the canonical place
+// that injects --force for bd's cross-actor close guard
+// (gastownhall/beads#3734): they run under the pod/controller actor with
+// BEADS_ACTOR stripped while closing agent-owned beads, mirroring the SDK
+// BdStore, which always force-closes. Do not add --force here — the wrappers
+// read the bead id as their first positional argument, so a leading --force
+// would break them. A new exec: wrapper that closes agent-owned beads must
+// inject --force itself.
 func (s *Store) Close(id string) error {
 	_, err := s.run(nil, "close", id)
 	if err != nil {
@@ -308,7 +367,10 @@ func (s *Store) List(query beads.ListQuery) ([]beads.Bead, error) {
 		if query.Type != "" {
 			args = append(args, "--type="+query.Type)
 		}
-		if query.Limit > 0 && query.CreatedBefore.IsZero() {
+		// SeekAfter (like CreatedBefore) is applied Go-side after the script
+		// returns, so a script-side limit would cut rows before the boundary
+		// filter runs and silently skip page rows.
+		if query.Limit > 0 && query.CreatedBefore.IsZero() && query.SeekAfter == nil {
 			args = append(args, "--limit="+strconv.Itoa(query.Limit))
 		}
 		out, err = s.run(nil, args...)
@@ -335,9 +397,17 @@ func (s *Store) ListOpen(status ...string) ([]beads.Bead, error) {
 }
 
 // Ready returns actionable open beads (excluding infrastructure types):
-// script ready
+// script ready [--include-ephemeral]
 func (s *Store) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
-	out, err := s.run(nil, "ready")
+	q := beads.ReadyQuery{}
+	if len(query) > 0 {
+		q = query[0]
+	}
+	args := []string{"ready"}
+	if q.TierMode == beads.TierBoth || q.TierMode == beads.TierWisps {
+		args = append(args, "--include-ephemeral")
+	}
+	out, err := s.run(nil, args...)
 	if err != nil {
 		return nil, fmt.Errorf("exec beads ready: %w", err)
 	}
@@ -346,16 +416,13 @@ func (s *Store) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
 		return nil, err
 	}
 	result := all[:0]
+	now := time.Now().UTC()
 	for _, b := range all {
-		if !b.Ephemeral && !beads.IsReadyExcludedType(b.Type) {
+		if beads.IsReadyCandidateForTier(b, now, q.TierMode) {
 			result = append(result, b)
 		}
 	}
-	if len(query) == 0 {
-		return result, nil
-	}
-	q := query[0]
-	return beads.ApplyListQuery(result, beads.ListQuery{Assignee: q.Assignee, Limit: q.Limit}), nil
+	return beads.ApplyListQuery(result, beads.ListQuery{Assignee: q.Assignee, Limit: q.Limit, TierMode: q.TierMode}), nil
 }
 
 // Children returns non-closed beads whose ParentID matches by default:
@@ -423,6 +490,36 @@ func (s *Store) SetMetadataBatch(id string, kvs map[string]string) error {
 	return nil
 }
 
+// SetLocalString sets a clone-local string value for a bead. See
+// [beads.Store.SetLocalString]. Kept in an in-process map rather than
+// delegated to the script, so it never pays script-invocation latency and
+// never validates that id refers to an existing bead — see the interface
+// doc comment for why.
+func (s *Store) SetLocalString(id, key, value string) error {
+	s.localMu.Lock()
+	defer s.localMu.Unlock()
+	if value == "" {
+		delete(s.localStrings[id], key)
+		return nil
+	}
+	if s.localStrings == nil {
+		s.localStrings = make(map[string]map[string]string)
+	}
+	if s.localStrings[id] == nil {
+		s.localStrings[id] = make(map[string]string)
+	}
+	s.localStrings[id][key] = value
+	return nil
+}
+
+// GetLocalString returns the clone-local string value for a bead. See
+// [beads.Store.GetLocalString].
+func (s *Store) GetLocalString(id, key string) (string, error) {
+	s.localMu.Lock()
+	defer s.localMu.Unlock()
+	return s.localStrings[id][key], nil
+}
+
 // Tx executes fn sequentially against the exec store.
 func (s *Store) Tx(_ string, fn func(beads.Tx) error) error {
 	if fn == nil {
@@ -433,8 +530,13 @@ func (s *Store) Tx(_ string, fn func(beads.Tx) error) error {
 
 // Delete permanently removes a bead by calling the "delete" subcommand.
 func (s *Store) Delete(id string) error {
-	_, err := s.run(nil, "delete", "--force", id)
-	return err
+	if _, err := s.run(nil, "delete", "--force", id); err != nil {
+		return err
+	}
+	s.localMu.Lock()
+	delete(s.localStrings, id)
+	s.localMu.Unlock()
+	return nil
 }
 
 // Ping verifies the store script is accessible by running a list operation.

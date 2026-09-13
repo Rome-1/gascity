@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/api/apierr"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
@@ -46,7 +48,6 @@ func newSlingTestServer(t *testing.T) (http.Handler, *fakeMutatorState) {
 
 func TestNewSyncsFormulaV2FeatureFlags(t *testing.T) {
 	state := newFakeMutatorState(t)
-	state.cfg.Daemon.FormulaV2 = true
 
 	formulatest.SetV2ForTest(t, false)
 	prevGraphApply := molecule.IsGraphApplyEnabled()
@@ -124,7 +125,7 @@ func TestSlingRefusesCityStoreBeadToRigTarget(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&problem); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if problem.Type != slingCrossStoreRouteProblemType {
+	if problem.Type != "urn:gascity:error:sling-cross-store-route" {
 		t.Fatalf("type = %q, want cross-store discriminator", problem.Type)
 	}
 	for _, want := range []string{"refusing cross-store route", "city:test-city", "myrig/worker", "rig:myrig"} {
@@ -416,7 +417,11 @@ func TestSlingProblemTypesDocumentedInOpenAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal components: %v", err)
 	}
-	for _, want := range []string{slingMissingBeadProblemType, slingCrossRigProblemType, slingCrossStoreRouteProblemType} {
+	for _, want := range []string{
+		"urn:gascity:error:sling-missing-bead",
+		"urn:gascity:error:sling-cross-rig",
+		"urn:gascity:error:sling-cross-store-route",
+	} {
 		if !bytes.Contains(components, []byte(want)) {
 			t.Fatalf("OpenAPI components missing problem type %q", want)
 		}
@@ -445,9 +450,9 @@ func TestDocumentProblemTypesIsIdempotent(t *testing.T) {
 			counts[s]++
 		}
 	}
-	for _, problemType := range documentedProblemTypes {
-		if counts[problemType] != 1 {
-			t.Fatalf("example count for %q = %d, want 1", problemType, counts[problemType])
+	for _, pt := range apierr.Registered() {
+		if counts[pt.URN()] != 1 {
+			t.Fatalf("example count for %q = %d, want 1", pt.URN(), counts[pt.URN()])
 		}
 	}
 }
@@ -635,7 +640,7 @@ func TestSlingSlotSuffixedPoolTargetNormalizesRoutedTo(t *testing.T) {
 	}
 }
 
-func TestSlingConflictReturns409ForExistingLiveWorkflow(t *testing.T) {
+func TestSlingGraphV2RejectsLegacySourceWorkflowConflict(t *testing.T) {
 	// The Huma migration moved sling to /v0/city/{cityName}/sling and
 	// replaced the old plain-JSON `{code, message, source_bead_id, ...}`
 	// error body with RFC 9457 Problem Details. The source-workflow
@@ -660,7 +665,6 @@ func TestSlingConflictReturns409ForExistingLiveWorkflow(t *testing.T) {
 	})
 
 	srv, state := newSlingTestServer(t)
-	state.cfg.Daemon.FormulaV2 = true
 	setFormulaV2(true)
 	molecule.SetGraphApplyEnabled(true)
 	formulaDir := t.TempDir()
@@ -685,7 +689,7 @@ title = "Do work"
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := store.Create(beads.Bead{
+	if _, err := store.Create(beads.Bead{
 		Title:  "existing workflow",
 		Type:   "task",
 		Status: "in_progress",
@@ -694,8 +698,7 @@ title = "Do work"
 			"gc.formula_contract": "graph.v2",
 			"gc.source_bead_id":   source.ID,
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -706,41 +709,123 @@ title = "Do work"
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body = %s", rec.Code, rec.Body.String())
 	}
+	source, err = store.Get(source.ID)
+	if err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	if source.Metadata["workflow_id"] != "" {
+		t.Fatalf("source workflow_id = %q, want graph.v2 launch to leave source metadata untouched", source.Metadata["workflow_id"])
+	}
+}
 
-	// Problem Details body: {title, status, detail, errors: [{location, value}, ...]}.
+// listFailBeadStore fails every List call, modeling a schema-skewed rig store
+// whose live-root scan errors lazily — the exact failure the tolerant
+// source-workflow scan is meant to survive.
+type listFailBeadStore struct {
+	beads.Store
+	err error
+}
+
+func (s listFailBeadStore) List(beads.ListQuery) ([]beads.Bead, error) {
+	return nil, s.err
+}
+
+// TestSlingToleratesDegradedNonSourceStoreScan proves the API sling path wires
+// SourceWorkflowStoreScanWarning so a running city's sling degrades a
+// non-source rig store's failed live-root scan to a warning instead of aborting
+// the launch. The domain keeps every non-source scan failure fatal when the
+// sink is nil (internal/sling/sling_core.go), so before the fix this graph.v2
+// launch failed on the skewed "rig:stale" store — the dominant production path,
+// since a running city routes `gc sling` through this API handler rather than
+// the CLI's local sling.
+func TestSlingToleratesDegradedNonSourceStoreScan(t *testing.T) {
+	// Same compile-time flag choreography as
+	// TestSlingGraphV2RejectsLegacySourceWorkflowConflict: flip the shared
+	// FormulaV2 + graph-apply flags only after New() has run so syncFeatureFlags
+	// cannot stomp them back.
+	setFormulaV2 := formulatest.LockV2ForTest(t)
+	prevGraphApply := molecule.IsGraphApplyEnabled()
+	t.Cleanup(func() {
+		molecule.SetGraphApplyEnabled(prevGraphApply)
+	})
+
+	var capturedStderr bytes.Buffer
+	origStderr := apiSlingStderr
+	apiSlingStderr = func() io.Writer { return &capturedStderr }
+	t.Cleanup(func() { apiSlingStderr = origStderr })
+
+	srv, state := newSlingTestServer(t)
+	setFormulaV2(true)
+	molecule.SetGraphApplyEnabled(true)
+	formulaDir := t.TempDir()
+	state.cfg.FormulaLayers.City = []string{formulaDir}
+	state.cfg.Agents = append(state.cfg.Agents,
+		config.Agent{Name: config.ControlDispatcherAgentName, MaxActiveSessions: intPtr(1)},
+		config.Agent{Name: config.ControlDispatcherAgentName, Dir: "myrig", MaxActiveSessions: intPtr(1)},
+	)
+	if err := os.WriteFile(filepath.Join(formulaDir, "graph-work.toml"), []byte(`
+formula = "graph-work"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "step"
+title = "Do work"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := state.stores["myrig"]
+	source, err := store.Create(beads.Bead{ID: "BL-42", Title: "test task", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second, schema-skewed rig store that fails its live-root scan. It is not
+	// the selected source store (rig:myrig holds the source bead), so a wired
+	// sink must skip it with a warning rather than abort the singleton check.
+	scanErr := errors.New("schema v54 has no revision")
+	state.stores["stale"] = listFailBeadStore{Store: beads.NewMemStore(), err: scanErr}
+
+	body := `{"target":"myrig/worker","formula":"graph-work","attached_bead_id":"` + source.ID + `"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newPostRequest(cityURL(state, "/sling"), strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a degraded non-source store must not abort the sling); body = %s", rec.Code, rec.Body.String())
+	}
 	var resp struct {
-		Title  string `json:"title"`
-		Status int    `json:"status"`
-		Detail string `json:"detail"`
-		Errors []struct {
-			Location string `json:"location"`
-			Value    any    `json:"value"`
-		} `json:"errors"`
+		Status     string   `json:"status"`
+		WorkflowID string   `json:"workflow_id"`
+		Warnings   []string `json:"warnings"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Status != http.StatusConflict {
-		t.Fatalf("status field = %d, want 409", resp.Status)
+	if resp.Status != "slung" {
+		t.Fatalf("status = %q, want slung", resp.Status)
 	}
-
-	// Build a location -> value lookup so assertions don't depend on
-	// the errors[] array order.
-	got := map[string]any{}
-	for _, e := range resp.Errors {
-		got[e.Location] = e.Value
+	if resp.WorkflowID == "" {
+		t.Fatal("workflow_id empty, want graph.v2 launch to mint a run root despite the degraded store")
 	}
-
-	if got["body.source_bead_id"] != source.ID {
-		t.Fatalf("source_bead_id = %#v, want %s", got["body.source_bead_id"], source.ID)
+	warning := capturedStderr.String()
+	if !strings.Contains(warning, "rig:stale") || !strings.Contains(warning, "revision") {
+		t.Fatalf("scan warning = %q, want an operator warning naming the skipped rig:stale store and its scan error", warning)
 	}
-	ids, ok := got["body.blocking_workflow_ids"].([]any)
-	if !ok || len(ids) != 1 || ids[0] != root.ID {
-		t.Fatalf("blocking_workflow_ids = %#v, want [%s]", got["body.blocking_workflow_ids"], root.ID)
+	// The degraded-scan warning must also reach the API caller through the
+	// response `warnings` field, not only the server log: a running city routes
+	// `gc sling` through this handler, so the invoking human/agent sees only the
+	// JSON response and would otherwise be blind to the coverage degradation.
+	var respWarning string
+	for _, w := range resp.Warnings {
+		if strings.Contains(w, "rig:stale") {
+			respWarning = w
+			break
+		}
 	}
-	hint, _ := got["body.hint"].(string)
-	if !strings.Contains(hint, "--store-ref rig:myrig --apply") {
-		t.Fatalf("hint = %q, want store-ref cleanup command", hint)
+	if respWarning == "" {
+		t.Fatalf("response warnings = %v, want an entry naming the skipped rig:stale store", resp.Warnings)
+	}
+	if !strings.Contains(respWarning, "revision") {
+		t.Fatalf("response warning = %q, want it to name the rig:stale scan error", respWarning)
 	}
 }
 
@@ -811,7 +896,7 @@ func TestSlingRigContext(t *testing.T) {
 func TestSlingDashboardRigQualifiesBareTarget(t *testing.T) {
 	h, state := newSlingTestServer(t)
 	// Bare "worker" with body.Rig="myrig" (no scope_kind) — mirrors
-	// `sling <bead> worker --rig=myrig` via cmd/gc/dashboard/api.go.
+	// `sling <bead> worker --rig=myrig` as the dashboard SPA issues it.
 	// Must resolve to myrig/worker and hit the happy direct-bead path.
 	body := `{"target":"worker","bead":"abc","rig":"myrig"}`
 	rec := httptest.NewRecorder()
@@ -1102,5 +1187,241 @@ func TestApiVsAgentutilResolverParity(t *testing.T) {
 				t.Fatalf("agentutil.ResolveAgent QualifiedName = %q, want %q", utilAgent.QualifiedName(), tc.utilWantQName)
 			}
 		})
+	}
+}
+
+// --- ga-nqdff: the source-bead singleton guard on a split city ---
+//
+// These rows live beside TestSlingGraphV2RejectsLegacySourceWorkflowConflict
+// rather than in their own file because they need the same FormulaV2 +
+// graph-apply choreography, and internal/testenv's legacy-flag freeze caps how
+// many test files per package may couple to that mechanism. The enumerator-shape
+// rows, which need no flags, are in handler_sling_graph_binding_test.go.
+
+// newGraphBindingSlingFixture builds the split-city sling fixture the
+// source-bead singleton rows share: a graph.v2 formula on disk, a control
+// dispatcher for each scope, and a source bead in the rig work store. The
+// caller decides whether the graph class is relocated by wiring
+// state.graphBeadStore before slinging.
+func newGraphBindingSlingFixture(t *testing.T) (http.Handler, *fakeMutatorState, beads.Bead) {
+	t.Helper()
+	// Same compile-time flag choreography as
+	// TestSlingGraphV2RejectsLegacySourceWorkflowConflict: flip the shared
+	// FormulaV2 + graph-apply flags only after New() has run so syncFeatureFlags
+	// cannot stomp them back.
+	setFormulaV2 := formulatest.LockV2ForTest(t)
+	prevGraphApply := molecule.IsGraphApplyEnabled()
+	t.Cleanup(func() { molecule.SetGraphApplyEnabled(prevGraphApply) })
+
+	srv, state := newSlingTestServer(t)
+	setFormulaV2(true)
+	molecule.SetGraphApplyEnabled(true)
+
+	formulaDir := t.TempDir()
+	state.cfg.FormulaLayers.City = []string{formulaDir}
+	state.cfg.Agents = append(state.cfg.Agents,
+		config.Agent{Name: config.ControlDispatcherAgentName, MaxActiveSessions: intPtr(1)},
+		config.Agent{Name: config.ControlDispatcherAgentName, Dir: "myrig", MaxActiveSessions: intPtr(1)},
+	)
+	if err := os.WriteFile(filepath.Join(formulaDir, "graph-work.toml"), []byte(`
+formula = "graph-work"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "step"
+title = "Do work"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source, err := state.stores["myrig"].Create(beads.Bead{ID: "BL-42", Title: "test task", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, state, source
+}
+
+// seedBindingResidentWorkflowRoot writes a live graph.v2 workflow root into the
+// relocated graph binding, stamped exactly the way doStartGraphWorkflow stamps
+// one: gc.source_bead_id plus the gc.source_store_ref of the WORK store the
+// source bead lives in.
+func seedBindingResidentWorkflowRoot(t *testing.T, graph beads.Store, sourceBeadID string) beads.Bead {
+	t.Helper()
+	// Burn the binding's first id so the root's id differs from the source
+	// bead's id in the rig store. Both stores mint "gc-1" first, and a conflict
+	// body that echoes the source bead would otherwise satisfy an assertion that
+	// the blocking ROOT is named.
+	if _, err := graph.Create(beads.Bead{Title: "id spacer", Type: "task"}); err != nil {
+		t.Fatalf("Create(id spacer): %v", err)
+	}
+	root, err := graph.Create(beads.Bead{
+		Title:  "existing workflow",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+			beadmeta.SourceBeadIDMetadataKey:    sourceBeadID,
+			beadmeta.SourceStoreRefMetadataKey:  "rig:myrig",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(binding root): %v", err)
+	}
+	return root
+}
+
+func postGraphSling(t *testing.T, srv http.Handler, state *fakeMutatorState, sourceBeadID string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := `{"target":"myrig/worker","formula":"graph-work","attached_bead_id":"` + sourceBeadID + `"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newPostRequest(cityURL(state, "/sling"), strings.NewReader(body)))
+	return rec
+}
+
+// TestSlingRefusesSecondWorkflowWhenLiveRootLivesInGraphBinding is the
+// split-refusal row for ga-nqdff.
+//
+// On a converged split city every live workflow root is graph class and lives in
+// the relocated binding, NOT in the work stores sourceWorkflowStores enumerated.
+// The singleton guard therefore answered "no conflict" from stores that
+// structurally cannot hold the answer, and the sling admitted a SECOND live
+// workflow for a source bead that already had one.
+func TestSlingRefusesSecondWorkflowWhenLiveRootLivesInGraphBinding(t *testing.T) {
+	srv, state, source := newGraphBindingSlingFixture(t)
+	graph := beads.NewMemStore()
+	state.graphBeadStore = graph
+	root := seedBindingResidentWorkflowRoot(t, graph, source.ID)
+
+	rec := postGraphSling(t, srv, state, source.ID)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (a binding-resident live root must block a second launch); body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), root.ID) {
+		t.Fatalf("conflict body = %s, want it to name the blocking binding-resident root %s", rec.Body.String(), root.ID)
+	}
+	reloaded, err := state.stores["myrig"].Get(source.ID)
+	if err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	if reloaded.Metadata["workflow_id"] != "" {
+		t.Fatalf("source workflow_id = %q, want a refused launch to leave source metadata untouched", reloaded.Metadata["workflow_id"])
+	}
+}
+
+// TestSlingAdmitsWhenGraphBindingRootIsClosed is the control for the row above:
+// the same split fixture with the binding-resident root CLOSED admits the
+// launch. Without it a graph leg that simply refused everything would pass the
+// refusal row.
+func TestSlingAdmitsWhenGraphBindingRootIsClosed(t *testing.T) {
+	srv, state, source := newGraphBindingSlingFixture(t)
+	graph := beads.NewMemStore()
+	state.graphBeadStore = graph
+	root := seedBindingResidentWorkflowRoot(t, graph, source.ID)
+	if _, err := graph.CloseAll([]string{root.ID}, map[string]string{
+		"close_reason": "control row: the blocking workflow finished before this sling",
+	}); err != nil {
+		t.Fatalf("CloseAll(%s): %v", root.ID, err)
+	}
+
+	rec := postGraphSling(t, srv, state, source.ID)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a closed binding root is not a live conflict); body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Status     string `json:"status"`
+		WorkflowID string `json:"workflow_id"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "slung" || resp.WorkflowID == "" {
+		t.Fatalf("response = %+v, want a slung launch with a workflow id", resp)
+	}
+}
+
+// TestSlingAdmitsWhenAClosedBindingRootSupersedesItsRetainedTwin is ga-x5lpj at
+// the API door. A storage migration copies rows into the binding and deletes
+// nothing, so a converged city's work ledger still holds an OPEN frozen twin of
+// every relocated root. Once the binding's row is CLOSED, the live-root scan
+// stops returning it and the twin was the only row the guard saw — refusing a
+// sling whose only live root is gone. The same store list feeds both doors, so
+// this row proves the wiring, not a second copy of the collector's matrix.
+func TestSlingAdmitsWhenAClosedBindingRootSupersedesItsRetainedTwin(t *testing.T) {
+	srv, state, source := newGraphBindingSlingFixture(t)
+	graph := beads.NewMemStore()
+	state.graphBeadStore = graph
+	root := seedBindingResidentWorkflowRoot(t, graph, source.ID)
+	if _, err := graph.CloseAll([]string{root.ID}, map[string]string{
+		"close_reason": "the relocated workflow finished before this sling",
+	}); err != nil {
+		t.Fatalf("CloseAll(%s): %v", root.ID, err)
+	}
+	work := beads.NewMemStore()
+	work.HonorExplicitIDs = true
+	state.cityBeadStore = work
+	twin, err := work.Create(beads.Bead{
+		ID:     root.ID,
+		Title:  "retained copy of the relocated workflow root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+			beadmeta.SourceBeadIDMetadataKey:    source.ID,
+			beadmeta.SourceStoreRefMetadataKey:  "rig:myrig",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(retained twin): %v", err)
+	}
+	if twin.ID != root.ID {
+		t.Fatalf("retained twin minted %s, want the relocated root's id %s", twin.ID, root.ID)
+	}
+
+	rec := postGraphSling(t, srv, state, source.ID)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the binding closed %s, so the retained twin is not a live conflict; body = %s",
+			rec.Code, root.ID, rec.Body.String())
+	}
+	var resp struct {
+		Status     string `json:"status"`
+		WorkflowID string `json:"workflow_id"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "slung" || resp.WorkflowID == "" {
+		t.Fatalf("response = %+v, want a slung launch with a workflow id", resp)
+	}
+}
+
+// TestSlingFailsWhenGraphBindingScanFails pins decision (3): a fault on the
+// store that HOLDS the answer refuses the sling. Degrading it to the
+// non-source-store warning would let a binding outage read as "no conflict" —
+// residency doctrine's "a binding fault is an error, never absence".
+func TestSlingFailsWhenGraphBindingScanFails(t *testing.T) {
+	srv, state, source := newGraphBindingSlingFixture(t)
+	scanErr := errors.New("graph binding unreachable")
+	state.graphBeadStore = listFailBeadStore{Store: beads.NewMemStore(), err: scanErr}
+
+	rec := postGraphSling(t, srv, state, source.ID)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("status = 200, want a refusal: a graph-binding scan fault must not read as no-conflict; body = %s", rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "graph:"+state.cityName) || !strings.Contains(body, "unreachable") {
+		t.Fatalf("error body = %s, want it to name the graph leg and its scan error", body)
+	}
+	reloaded, err := state.stores["myrig"].Get(source.ID)
+	if err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	if reloaded.Metadata["workflow_id"] != "" {
+		t.Fatalf("source workflow_id = %q, want a refused launch to leave source metadata untouched", reloaded.Metadata["workflow_id"])
 	}
 }

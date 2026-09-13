@@ -1,20 +1,33 @@
 package api
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
 func TestResolvedSessionConfigForProviderBuildsNormalizedConfig(t *testing.T) {
+	t.Setenv("API_SESSION_WORKSPACE_VALUE", "expanded-workspace-value")
 	metadata := map[string]string{
 		"session_origin": "named",
 		"agent_name":     "myrig/worker-adhoc-123",
 	}
-	env := map[string]string{"API_TOKEN": "present"}
+	workspaceEnv := map[string]string{
+		"WORKSPACE_ONLY":         "$API_SESSION_WORKSPACE_VALUE",
+		"SESSION_ENV_PRECEDENCE": "workspace",
+		"GC_BIN":                 "/workspace/bin/gc",
+	}
+	env := map[string]string{
+		"API_TOKEN":              "present",
+		"SESSION_ENV_PRECEDENCE": "provider",
+		"GC_BIN":                 "/provider/bin/gc",
+	}
 	mcpServers := []runtime.MCPServerConfig{{
 		Name:    "filesystem",
 		Command: "/bin/mcp",
@@ -36,6 +49,7 @@ func TestResolvedSessionConfigForProviderBuildsNormalizedConfig(t *testing.T) {
 
 	cfg, err := resolvedSessionConfigForProvider(
 		"/tmp/test-city",
+		workspaceEnv,
 		"worker",
 		"worker-named",
 		"myrig/worker",
@@ -90,11 +104,108 @@ func TestResolvedSessionConfigForProviderBuildsNormalizedConfig(t *testing.T) {
 	if got, want := cfg.Runtime.SessionEnv["API_TOKEN"], "present"; got != want {
 		t.Fatalf("Runtime.SessionEnv[API_TOKEN] = %q, want %q", got, want)
 	}
+	gcBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	for key, want := range map[string]string{
+		"WORKSPACE_ONLY":         "expanded-workspace-value",
+		"SESSION_ENV_PRECEDENCE": "provider",
+		"GC_BIN":                 gcBin,
+	} {
+		if got := cfg.Runtime.SessionEnv[key]; got != want {
+			t.Errorf("Runtime.SessionEnv[%s] = %q, want %q", key, got, want)
+		}
+		if got := cfg.Runtime.Hints.Env[key]; got != want {
+			t.Errorf("Runtime.Hints.Env[%s] = %q, want %q", key, got, want)
+		}
+	}
+	// PR #4577 review (behavioral-correctness major): the API create path must
+	// pair authoritative GC_BIN with the same PATH prepend the CLI applies, so a
+	// bare `gc` in the session resolves to this binary, not a colliding one.
+	wantPATHPrefix := filepath.Dir(gcBin)
+	for name, env := range map[string]map[string]string{
+		"Runtime.SessionEnv": cfg.Runtime.SessionEnv,
+		"Runtime.Hints.Env":  cfg.Runtime.Hints.Env,
+	} {
+		parts := strings.Split(env["PATH"], string(os.PathListSeparator))
+		if len(parts) == 0 || parts[0] != wantPATHPrefix {
+			t.Errorf("%s[PATH] = %q, want first entry %q (dir of GC_BIN)", name, env["PATH"], wantPATHPrefix)
+		}
+	}
+}
+
+// TestResolvedSessionConfigForProviderPinsControllerTokenEmpty is the
+// regression for the PR #4577 review (security major): cityAnchoredSessionEnv
+// expands workspace and provider env against the controller process, so a
+// configured `GC_CONTROLLER_TOKEN = "$GC_CONTROLLER_TOKEN"` (or a literal)
+// would otherwise leak the controller-only token into a managed session.
+//
+// Withheld means PRESENT AND EMPTY, not absent. This env is an overlay on an
+// environment the managed session already inherits — the tmux server's global
+// env, or os.Environ() on the subprocess/ACP paths — so an absent key is an
+// inherited key, and asserting absence asserts the symptom of the bug. The
+// copy-under-another-name shape is driven too: no key-level guard can catch
+// `WORKSPACE_COPY = "$GC_CONTROLLER_TOKEN"`, only the masked expansion can.
+func TestResolvedSessionConfigForProviderPinsControllerTokenEmpty(t *testing.T) {
+	const token = "super-secret-controller-token"
+	t.Setenv(convergence.TokenEnvVar, token)
+	workspaceEnv := map[string]string{
+		// Expands from the controller process env — the exact leak vector.
+		convergence.TokenEnvVar: "$" + convergence.TokenEnvVar,
+		"WORKSPACE_COPY":        "$" + convergence.TokenEnvVar,
+	}
+	cfg, err := resolvedSessionConfigForProvider(
+		"/tmp/test-city",
+		workspaceEnv,
+		"worker",
+		"",
+		"myrig/worker",
+		"Worker",
+		"",
+		nil,
+		&config.ResolvedProvider{
+			Name:    "stub",
+			Command: "/bin/echo",
+			Env: map[string]string{
+				convergence.TokenEnvVar: "literal-token-value",
+				"PROVIDER_COPY":         "${" + convergence.TokenEnvVar + "}",
+			},
+		},
+		"",
+		"/tmp/workdir",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("resolvedSessionConfigForProvider: %v", err)
+	}
+	for name, env := range map[string]map[string]string{
+		"Runtime.SessionEnv": cfg.Runtime.SessionEnv,
+		"Runtime.Hints.Env":  cfg.Runtime.Hints.Env,
+	} {
+		val, present := env[convergence.TokenEnvVar]
+		if !present {
+			t.Errorf("%s omits %s; want present and empty so the session cannot inherit the controller's value", name, convergence.TokenEnvVar)
+		} else if val != "" {
+			t.Errorf("%s[%s] = %q, want empty (a config-authored literal must not overwrite the pin)", name, convergence.TokenEnvVar, val)
+		}
+		for _, key := range []string{"WORKSPACE_COPY", "PROVIDER_COPY"} {
+			if got := env[key]; got != "" {
+				t.Errorf("%s[%s] = %q, want empty ($VAR expansion must not copy the controller token into another name)", name, key, got)
+			}
+		}
+		for key, val := range env {
+			if strings.Contains(val, token) {
+				t.Errorf("%s[%s] = %q carries the controller token", name, key, val)
+			}
+		}
+	}
 }
 
 func TestResolvedSessionConfigForProviderRejectsNilProvider(t *testing.T) {
 	if _, err := resolvedSessionConfigForProvider(
 		"/tmp/test-city",
+		nil,
 		"worker",
 		"",
 		"myrig/worker",
@@ -127,6 +238,39 @@ func TestSessionCreateHintsSeedsRuntimeEnv(t *testing.T) {
 	}
 }
 
+// TestSessionCreateHintsEnablesMouse locks the ga-c4w contract for the API
+// session-create paths (provider-adhoc + named): they must resolve mouse-on so
+// the tmux wheel drives copy-mode scrollback instead of leaking to the focused
+// TUI. The runtime skips disableMouseAndActivity only when MouseOn is true (the
+// guard in internal/runtime/tmux adapter), so this seam flips both API callers;
+// the `gc session new` CLI resolves MouseOn separately in cmd/gc
+// (workerSessionCreateHints + templateParamsToConfig). Headless agent sessions
+// resolve MouseOn from cmd/gc/template_resolve.go and are unaffected (guarded
+// separately in template_resolve_prompt_test.go).
+func TestSessionCreateHintsEnablesMouse(t *testing.T) {
+	hints := sessionCreateHints(&config.ResolvedProvider{Name: "stub"}, nil, nil)
+	if !hints.MouseOn {
+		t.Error("sessionCreateHints().MouseOn = false, want true (interactive wheel→scrollback, ga-c4w)")
+	}
+}
+
+// TestSessionResumeHintsEnablesMouse locks ga-c4w finding #2 and its ga-g7go
+// follow-up: an interactive (session_origin=manual) session that is suspended/
+// resumed or crash-restarted must keep mouse-on so the tmux wheel still drives
+// copy-mode scrollback after resume — symmetric with sessionCreateHints. A
+// controller-polled pool/headless resume must resolve mouse-OFF instead: the
+// resume seam may not re-enable mouse on a polled agent. The earlier form proved
+// only the interactive case and let the unconditional MouseOn=true default leak
+// mouse-on onto resumed pool agents (ga-g7go).
+func TestSessionResumeHintsEnablesMouse(t *testing.T) {
+	if hints := sessionResumeHints(&config.ResolvedProvider{Name: "stub"}, "", nil, nil, true); !hints.MouseOn {
+		t.Error("sessionResumeHints(interactive=true).MouseOn = false, want true (interactive wheel survives resume, ga-c4w)")
+	}
+	if hints := sessionResumeHints(&config.ResolvedProvider{Name: "stub"}, "", nil, nil, false); hints.MouseOn {
+		t.Error("sessionResumeHints(interactive=false).MouseOn = true, want false (polled pool agent stays mouse-off, ga-g7go)")
+	}
+}
+
 // TestResolvedSessionConfigForProviderSeedsCityRuntimeEnv is a
 // regression test for upstream gastownhall/gascity#101 (re-opened):
 // session-create paths through the API resolver dropped the
@@ -145,6 +289,7 @@ func TestResolvedSessionConfigForProviderSeedsCityRuntimeEnv(t *testing.T) {
 	cityPath := t.TempDir()
 	cfg, err := resolvedSessionConfigForProvider(
 		cityPath,
+		nil,
 		"worker",
 		"",
 		"myrig/worker",
@@ -234,6 +379,7 @@ func TestResolvedSessionConfigForProviderCityAnchorsBeatConflictingProviderEnv(t
 	cityPath := t.TempDir()
 	cfg, err := resolvedSessionConfigForProvider(
 		cityPath,
+		nil,
 		"worker",
 		"",
 		"myrig/worker",
@@ -269,7 +415,7 @@ func TestCityAnchoredSessionEnvSkipsCityAnchorsWhenCityPathEmpty(t *testing.T) {
 		"PROVIDER_TOKEN": "ok",
 	}
 
-	got := cityAnchoredSessionEnv(" \t\n ", providerEnv)
+	got := cityAnchoredSessionEnv(" \t\n ", nil, providerEnv)
 	if got["GC_CITY"] != "/provider/city" {
 		t.Fatalf("GC_CITY = %q, want provider value", got["GC_CITY"])
 	}
@@ -292,6 +438,7 @@ func TestCityAnchoredSessionEnvSkipsCityAnchorsWhenCityPathEmpty(t *testing.T) {
 func TestResolvedSessionConfigForProviderSkipsStoredMCPMetadataForTmuxTransport(t *testing.T) {
 	cfg, err := resolvedSessionConfigForProvider(
 		"/tmp/test-city",
+		nil,
 		"worker",
 		"",
 		"myrig/worker",

@@ -47,19 +47,29 @@ BEADS_DOLT_PASSWORD=%s
 BEADS_DOLT_SERVER_DATABASE=%s
 BEADS_CREDENTIALS_FILE=%s
 GC_BEADS=%s
+GC_BEADS_BACKEND=%s
+BEADS_BACKEND=%s
 GC_BEADS_PREFIX=%s
 BD_EXPORT_AUTO=%s
 ' \
   "${BEADS_DIR:-}" "${GC_DOLT_HOST:-}" "${GC_DOLT_PORT:-}" "${GC_DOLT_USER:-}" "${GC_DOLT_PASSWORD:-}" \
   "${BEADS_DOLT_SERVER_HOST:-}" "${BEADS_DOLT_SERVER_PORT:-}" "${BEADS_DOLT_SERVER_USER:-}" "${BEADS_DOLT_PASSWORD:-}" \
-  "${BEADS_DOLT_SERVER_DATABASE:-}" "${BEADS_CREDENTIALS_FILE:-}" "${GC_BEADS:-}" "${GC_BEADS_PREFIX:-}" \
+  "${BEADS_DOLT_SERVER_DATABASE:-}" "${BEADS_CREDENTIALS_FILE:-}" "${GC_BEADS:-}" "${GC_BEADS_BACKEND:-}" "${BEADS_BACKEND:-}" "${GC_BEADS_PREFIX:-}" \
   "${BD_EXPORT_AUTO:-}" > "` + envFile + `"
 printf '%s
 ' "$*" > "` + argsFile + `"
+if [ "${1:-}" = "--dolt-auto-commit" ]; then
+  shift 2
+fi
 case "${1:-}" in
   create)
     cat <<'JSON'
 {"id":"BD-1","title":"captured","status":"open","issue_type":"task","created_at":"2026-02-27T10:00:00Z"}
+JSON
+    ;;
+  show)
+    cat <<'JSON'
+[{"id":"BD-1","title":"captured","status":"open","issue_type":"task","created_at":"2026-02-27T10:00:00Z"}]
 JSON
     ;;
   list)
@@ -170,6 +180,91 @@ func TestBdStoreBridgeCreateCmdProjectsCanonicalEnvAndClearsAmbientAuthority(t *
 	}
 }
 
+func TestBdStoreBridgeGetCmdReturnsBead(t *testing.T) {
+	scopeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(scopeDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	envFile := filepath.Join(t.TempDir(), "bridge.env")
+	argsFile := filepath.Join(t.TempDir(), "bridge.args")
+	writeFakeBdBridgeScript(t, binDir, envFile, argsFile)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"bd-store-bridge",
+		"--dir", scopeDir,
+		"--host", "db.example.internal",
+		"--port", "3317",
+		"get",
+		"BD-1",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, stderr = %s", code, stderr.String())
+	}
+
+	var bead bdStoreBridgeBead
+	if err := json.Unmarshal(stdout.Bytes(), &bead); err != nil {
+		t.Fatalf("stdout JSON: %v\n%s", err, stdout.String())
+	}
+	if bead.ID != "BD-1" || bead.Title != "captured" || bead.Type != "task" {
+		t.Fatalf("unexpected bead payload: %#v", bead)
+	}
+
+	argsText, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("ReadFile(args): %v", err)
+	}
+	if got := strings.TrimSpace(string(argsText)); got != "show --json BD-1" {
+		t.Fatalf("get args = %q, want %q", got, "show --json BD-1")
+	}
+}
+
+func TestBdStoreBridgeDoltliteClearsDoltServerEnv(t *testing.T) {
+	scopeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(scopeDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scopeDir, ".beads", "metadata.json"), []byte(`{"backend":"doltlite","database":"doltlite"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	envFile := filepath.Join(t.TempDir(), "bridge.env")
+	argsFile := filepath.Join(t.TempDir(), "bridge.args")
+	writeFakeBdBridgeScript(t, binDir, envFile, argsFile)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GC_BEADS_BACKEND", "doltlite")
+	var stdout, stderr bytes.Buffer
+	withTestStdin(t, `{"title":"captured","type":"task"}`+"\n", func() {
+		code := run([]string{
+			"bd-store-bridge",
+			"--dir", scopeDir,
+			"--host", "db.example.internal",
+			"--port", "3317",
+			"--user", "root",
+			"create",
+		}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("run() = %d, stderr = %s", code, stderr.String())
+		}
+	})
+
+	envMap := readExecCaptureEnv(t, envFile)
+	if got := envMap["GC_BEADS_BACKEND"]; got != "doltlite" {
+		t.Fatalf("GC_BEADS_BACKEND = %q, want doltlite", got)
+	}
+	if got := envMap["BEADS_BACKEND"]; got != "doltlite" {
+		t.Fatalf("BEADS_BACKEND = %q, want doltlite", got)
+	}
+	for _, key := range []string{"GC_DOLT_HOST", "GC_DOLT_PORT", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_AUTO_START"} {
+		if got := envMap[key]; got != "" {
+			t.Fatalf("%s = %q, want empty for doltlite bridge", key, got)
+		}
+	}
+}
+
 func TestBdStoreBridgeDepListCmdReturnsJSON(t *testing.T) {
 	scopeDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(scopeDir, ".beads"), 0o755); err != nil {
@@ -275,6 +370,8 @@ func TestBdStoreBridgeListCommandForwardsFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(args): %v", err)
 	}
+	// TierIssues + a single assignee has no Go-side-only residual filter, so
+	// BdStore pushes the caller's real limit straight to bd list (gc-i4j3y).
 	for _, want := range []string{"list", "--json", "--status=open", "--assignee=mayor", "--type=message", "--include-infra", "--include-gates", "--limit", "7"} {
 		if !strings.Contains(string(argsText), want) {
 			t.Fatalf("list args missing %q: %s", want, string(argsText))

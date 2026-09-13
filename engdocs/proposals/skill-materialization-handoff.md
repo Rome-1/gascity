@@ -159,10 +159,12 @@ Non-obvious lessons the future you should know:
    runtime will try to copy the symlinks into workdirs and shadow the
    materializer.
 
-3. **Eight providers, four with sinks.** `internal/hooks/hooks.go:80-96`
+3. **Not every provider gets a sink.** `internal/hooks/hooks.go:80-96`
    enumerates `claude`, `codex`, `gemini`, `opencode`, `copilot`,
-   `cursor`, `pi`, `omp`. Only the first four get skill sinks in
-   v0.15.1 (see spec "Vendor mapping" table). The other four are
+   `cursor`, `pi`, `omp`. The providers with skill sinks are `claude`,
+   `codex`, `gemini`, `opencode`, `mimocode` and `pi` — and `pi` shares
+   `codex`'s `.agents/skills` rather than getting its own (see spec
+   "Vendor mapping" table). The rest — `copilot`, `cursor`, `omp` — are
    explicit no-ops with an informational log line. Don't rediscover this.
 
 4. **Bootstrap pack cache path.** Bootstrap packs resolve to
@@ -272,7 +274,7 @@ Don't commit on behalf of the user unless asked.
 - `cmd/gc/cmd_doctor.go`, `cmd_mcp.go`, `cmd_skill.go`,
   `cmd_skill_test.go`, `init_provider_readiness.go`, `pool.go`,
   `pool_test.go`
-- `docs/reference/cli.md`, `config.md`, `docs/schema/city-schema.json`
+- `docs/reference/cli.md`, `config.md`, `docs/reference/schema/city-schema.json`
 - `internal/bootstrap/bootstrap.go`, `bootstrap_test.go`
 - `internal/config/compose.go`, `compose_test.go`, `config.go`,
   `config_test.go`, `field_sync_test.go`, `implicit_test.go`, `pack.go`,

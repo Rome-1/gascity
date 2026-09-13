@@ -25,7 +25,7 @@ args = ["notes-mcp"]
 
 	cityCfg := &config.City{
 		Workspace:  config.Workspace{Provider: "gemini"},
-		Providers:  map[string]config.ProviderSpec{"gemini": {Command: "echo", PromptMode: "none"}, "cursor": {Command: "echo", PromptMode: "none"}},
+		Providers:  map[string]config.ProviderSpec{"gemini": {Command: "echo", PromptMode: "none"}, "cursor": {Command: "echo", PromptMode: "none"}, "copilot": {Command: "echo", PromptMode: "none"}},
 		PackMCPDir: filepath.Join(cityPath, "mcp"),
 	}
 
@@ -143,23 +143,17 @@ args = ["notes-mcp"]
 		}
 	})
 
-	t.Run("implicit control dispatcher skips inherited pack mcp", func(t *testing.T) {
+	t.Run("control dispatcher skips inherited pack mcp", func(t *testing.T) {
 		cfg := &config.City{
 			Workspace:  config.Workspace{Provider: "claude"},
 			Providers:  map[string]config.ProviderSpec{"claude": {Command: "echo", PromptMode: "none"}},
-			Daemon:     config.DaemonConfig{FormulaV2: true},
+			Daemon:     config.DaemonConfig{FormulaV2: boolPtr(true)},
 			PackMCPDir: filepath.Join(cityPath, "mcp"),
 		}
-		config.InjectImplicitAgents(cfg)
-		var control *config.Agent
-		for i := range cfg.Agents {
-			if cfg.Agents[i].Name == config.ControlDispatcherAgentName {
-				control = &cfg.Agents[i]
-				break
-			}
-		}
-		if control == nil {
-			t.Fatal("InjectImplicitAgents did not create control-dispatcher")
+		control := &config.Agent{
+			Name:         config.ControlDispatcherAgentName,
+			StartCommand: config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			ProcessNames: []string{"gc"},
 		}
 		params := &agentBuildParams{
 			city:            cfg,

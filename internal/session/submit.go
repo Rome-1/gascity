@@ -13,8 +13,11 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/execenv"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 )
@@ -60,8 +63,12 @@ func SubmissionCapabilitiesForMetadata(metadata map[string]string, hasDeferredQu
 	transport := transportFromMetadata(beads.Bead{Metadata: metadata})
 	return SubmissionCapabilities{
 		SupportsFollowUp:     hasDeferredQueue && transport != "acp",
-		SupportsInterruptNow: true,
+		SupportsInterruptNow: supportsInterruptNowForMetadata(metadata),
 	}
+}
+
+func supportsInterruptNowForMetadata(metadata map[string]string) bool {
+	return ProviderFamilyFromMetadata(metadata, "") != "antigravity"
 }
 
 // SubmissionCapabilities reports which semantic submit intents the session can
@@ -108,9 +115,26 @@ func (m *Manager) submit(ctx context.Context, id, message, resumeCommand string,
 			outcome.Queued = true
 			return nil
 		case SubmitIntentInterruptNow:
+			if !supportsInterruptNowForMetadata(b.Metadata) {
+				return ErrInteractionUnsupported
+			}
 			return m.interruptAndSubmitLocked(ctx, id, b, sessName, message, resumeCommand, hints)
 		default:
 			running := m.sp.IsRunning(sessName)
+			if pendingConversationRestart(b) && !running {
+				// A reset or restart is recorded but the replacement runtime is
+				// not up yet. Delivering now would start the pane just to carry
+				// this message and, for a provider that keys its own
+				// conversation identity off the session's epoch, would do it
+				// against a conversation the operator has already discarded.
+				// Queue it for the incarnation the controller is about to bring
+				// up instead.
+				if err := m.enqueueDeferredSubmitLocked(b, sessName, message); err != nil {
+					return err
+				}
+				outcome.Queued = true
+				return nil
+			}
 			if (State(b.Metadata["state"]) == StateStartPending || State(b.Metadata["state"]) == StateCreating) && !running {
 				if err := m.enqueueDeferredSubmitLocked(b, sessName, message); err != nil {
 					return err
@@ -123,6 +147,14 @@ func (m *Manager) submit(ctx context.Context, id, message, resumeCommand string,
 		}
 	})
 	return outcome, err
+}
+
+// pendingConversationRestart reports whether a fresh restart has been recorded
+// for this session but not yet carried out, so its live runtime — if any — is
+// the outgoing incarnation.
+func pendingConversationRestart(b beads.Bead) bool {
+	return strings.TrimSpace(b.Metadata["continuation_reset_pending"]) != "" ||
+		strings.TrimSpace(b.Metadata["restart_requested"]) != ""
 }
 
 func (m *Manager) supportsFollowUpLocked(b beads.Bead) bool {
@@ -311,6 +343,26 @@ func ProviderFamilyFromMetadata(meta map[string]string, fallback string) string 
 
 func providerKind(b beads.Bead) string {
 	return ProviderFamilyFromMetadata(b.Metadata, "")
+}
+
+// ProviderFamilyFromInfo is the session.Info sibling of ProviderFamilyFromMetadata:
+// it walks the same builtin_ancestor → provider_kind → provider precedence ladder,
+// reading the raw mirrors Info carries (BuiltinAncestor, ProviderKind, Provider)
+// instead of the bead metadata map. Byte-identical to the metadata form for any
+// bead b (ProviderFamilyFromInfo(infoFromPersistedBead(b), fallback) ==
+// ProviderFamilyFromMetadata(b.Metadata, fallback)), so a caller holding a typed
+// Info can resolve the provider family without the raw bead.
+func ProviderFamilyFromInfo(info Info, fallback string) string {
+	if ancestor := strings.TrimSpace(info.BuiltinAncestor); ancestor != "" {
+		return sessionlog.ProviderFamily(ancestor)
+	}
+	if kind := strings.TrimSpace(info.ProviderKind); kind != "" {
+		return sessionlog.ProviderFamily(kind)
+	}
+	if provider := strings.TrimSpace(info.Provider); provider != "" {
+		return sessionlog.ProviderFamily(provider)
+	}
+	return sessionlog.ProviderFamily(fallback)
 }
 
 func wrappedProviderFamily(b beads.Bead, family string) bool {
@@ -519,7 +571,7 @@ func (m *Manager) enqueueDeferredSubmitLocked(b beads.Bead, sessName, message st
 		ID:                "nudge-" + NewInstanceToken()[:12],
 		Agent:             deferredSubmitAgentKey(b),
 		SessionID:         b.ID,
-		ContinuationEpoch: strings.TrimSpace(b.Metadata["continuation_epoch"]),
+		ContinuationEpoch: deferredSubmitEpoch(b),
 		Source:            "session",
 		Message:           message,
 		CreatedAt:         now,
@@ -534,9 +586,31 @@ func (m *Manager) enqueueDeferredSubmitLocked(b beads.Bead, sessName, message st
 		return fmt.Errorf("queueing deferred submit: %w", err)
 	}
 	if m.supportsFollowUpLocked(b) {
-		_ = startSessionSubmitPoller(m.cityPath, deferredSubmitAgentKey(b), sessName)
+		_ = startSessionSubmitPoller(m.cityPath, deferredSubmitPollerKey(b), sessName)
 	}
 	return nil
+}
+
+// deferredSubmitEpoch returns the continuation epoch a deferred submit is
+// fenced against.
+//
+// A submit deferred while a conversation reset is pending must survive the
+// reset's epoch rotation: commitPendingContinuationReset advances
+// continuation_epoch N->N+1 when the replacement incarnation starts, which
+// happens after this item is queued. A fixed epoch-N stamp would then fail the
+// queued-nudge fence (queuedNudgeMatchesTargetFence) and be dead-lettered,
+// silently dropping the message. Returning an empty epoch leaves the item
+// fenced by SessionID alone, so the post-reset incarnation — same session
+// bead, epoch N+1 — still claims and delivers it.
+//
+// A plain restart (restart_requested without a reset) does not rotate the
+// epoch, so those defers keep the current-epoch stamp and stay fenced to the
+// resumed conversation.
+func deferredSubmitEpoch(b beads.Bead) string {
+	if strings.TrimSpace(b.Metadata["continuation_reset_pending"]) != "" {
+		return ""
+	}
+	return strings.TrimSpace(b.Metadata["continuation_epoch"])
 }
 
 func deferredSubmitAgentKey(b beads.Bead) string {
@@ -555,15 +629,19 @@ func deferredSubmitAgentKey(b beads.Bead) string {
 	return b.Title
 }
 
+func deferredSubmitPollerKey(b beads.Bead) string {
+	return PollerKeyFromBead(b)
+}
+
 var (
 	startSessionSubmitPoller      = ensureSessionSubmitPoller
 	sessionSubmitPollerExecutable = os.Executable
 )
 
 func ensureSessionSubmitPoller(cityPath, agentName, sessionName string) error {
-	pidPath := sessionSubmitPollerPIDPath(cityPath, sessionName)
+	pidPath := sessionSubmitPollerPIDPath(cityPath, sessionName, agentName)
 	return withSessionSubmitPollerPIDLock(pidPath, func() error {
-		if running, _ := existingSessionSubmitPollerPID(pidPath); running {
+		if running, _ := existingSessionSubmitPollerPID(pidPath, cityPath, sessionName, agentName); running {
 			return nil
 		}
 		exe, err := sessionSubmitPollerExecutable()
@@ -573,9 +651,9 @@ func ensureSessionSubmitPoller(cityPath, agentName, sessionName string) error {
 		if isGoTestExecutable(exe) {
 			return fmt.Errorf("refusing to start nudge poller with Go test binary %q", exe)
 		}
-		cmd := exec.Command(exe, "nudge", "poll", "--city", cityPath, "--session", sessionName, agentName)
-		cmd.Env = os.Environ()
-		logFile, err := os.OpenFile(sessionSubmitPollerLogPath(cityPath, sessionName), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		cmd := exec.Command(exe, nudgepoller.CommandArgs(cityPath, sessionName, agentName)...)
+		cmd.Env = execenv.WithUsageMetricsDisabled(os.Environ())
+		logFile, err := os.OpenFile(sessionSubmitPollerLogPath(cityPath, sessionName, agentName), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 		if err != nil {
 			return err
 		}
@@ -599,15 +677,15 @@ func isGoTestExecutable(path string) bool {
 	return strings.HasSuffix(filepath.Base(path), ".test")
 }
 
-func sessionSubmitPollerPIDPath(cityPath, sessionName string) string {
-	return citylayout.RuntimePath(cityPath, "nudges", "pollers", sessionName+".pid")
+func sessionSubmitPollerPIDPath(cityPath, sessionName, agentName string) string {
+	return citylayout.RuntimePath(cityPath, "nudges", "pollers", nudgepoller.PollerFileStem(sessionName, agentName)+".pid")
 }
 
-func sessionSubmitPollerLogPath(cityPath, sessionName string) string {
-	return citylayout.RuntimePath(cityPath, "nudges", "pollers", sessionName+".log")
+func sessionSubmitPollerLogPath(cityPath, sessionName, agentName string) string {
+	return citylayout.RuntimePath(cityPath, "nudges", "pollers", nudgepoller.PollerFileStem(sessionName, agentName)+".log")
 }
 
-func existingSessionSubmitPollerPID(pidPath string) (bool, error) {
+func existingSessionSubmitPollerPID(pidPath, cityPath, sessionName, agentName string) (bool, error) {
 	data, err := os.ReadFile(pidPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -623,7 +701,10 @@ func existingSessionSubmitPollerPID(pidPath string) (bool, error) {
 	if _, err := fmt.Sscanf(pidText, "%d", &pid); err != nil || pid <= 0 {
 		return false, nil
 	}
-	if err := syscall.Kill(pid, 0); err == nil || errors.Is(err, syscall.EPERM) {
+	if cityPath == "" || sessionName == "" || agentName == "" {
+		return false, nil
+	}
+	if pidutil.AliveWithCmdline(pid, nudgepoller.CmdlineMatcher(cityPath, sessionName, agentName)) {
 		return true, nil
 	}
 	return false, nil

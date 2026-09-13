@@ -89,12 +89,13 @@ activation is **out of scope for v0.15.1** and lands on main afterwards.
 - **K8s / ACP runtime skill delivery.** Stage-2 is gated by runtime provider
   (see "Stage 2 runtime gate" below). K8s and ACP runtimes receive no skill
   materialization in v0.15.1 and log an informational line per session.
-- **`copilot`, `cursor`, `pi`, `omp` providers.** These four providers are
+- **`copilot`, `cursor`, `omp` providers.** These three providers are
   recognized by `internal/hooks/hooks.go:89-96` but receive no skill
   materialization in v0.15.1 — their skill-discovery conventions are not yet
   verified against current vendor docs. Their agents spawn without a skill
   sink; a single log line flags the skip at materialization time. Support is
-  a follow-up once vendor paths are confirmed.
+  a follow-up once vendor paths are confirmed. (`pi` was in this list until
+  its path was verified against pi 0.84.2; see the "Vendor mapping" table.)
 
 ## Design
 
@@ -199,12 +200,12 @@ workdir, or a sidecar init step).
 | Provider   | Skill sink           | v0.15.1 status    |
 |------------|----------------------|-------------------|
 | `claude`   | `.claude/skills/`    | materialize       |
-| `codex`    | `.codex/skills/`     | materialize       |
+| `codex`    | `.agents/skills/`    | materialize       |
 | `gemini`   | `.gemini/skills/`    | materialize       |
 | `opencode` | `.opencode/skills/`  | materialize       |
 | `copilot`  | —                    | skip (no sink)    |
 | `cursor`   | —                    | skip (no sink)    |
-| `pi`       | —                    | skip (no sink)    |
+| `pi`       | `.agents/skills/`    | shared with codex |
 | `omp`      | —                    | skip (no sink)    |
 
 Implemented as a map keyed on `agent.Provider`; providers without an entry
@@ -260,7 +261,7 @@ are removed outright. The full deletion surface:
 | `cmd/gc/pool.go:264-279` (deep-copy)       | Pool deep-copy entries for the four fields                  |
 | `cmd/gc/cmd_skill.go:97-107`               | `attachmentSet` / `filterEntriesByName` filter path         |
 | `cmd/gc/cmd_mcp.go` (equivalent filter)    | MCP filter path                                             |
-| `docs/schema/city-schema.json`             | Schema entries for `skills`, `mcp`, `skills_append`, `mcp_append` |
+| `docs/reference/schema/city-schema.json`             | Schema entries for `skills`, `mcp`, `skills_append`, `mcp_append` |
 | `docs/reference/config.md:162-200`         | Reference-doc entries for the removed fields                |
 | `internal/config/compose_test.go:242-246`  | Attachment-defaults compose test                            |
 | `internal/config/config_test.go:118-139`   | `TestParseAgentSkillsAndMCP` — delete test entirely         |
@@ -463,7 +464,7 @@ scope root:
   .claude/skills/           # materialized for claude agents
     gc-work/ -> ...
     plan/ -> ...
-  .codex/skills/            # materialized for codex agents
+  .agents/skills/           # materialized for codex agents
     gc-work/ -> ...
     plan/ -> ...
 ```
@@ -686,7 +687,7 @@ That is not part of this release.
 1. **Vendor path verification.** Each `materialize` map entry must be
    re-verified against the vendor's current CLI docs during
    implementation. Swap entries as needed.
-2. **Support for `copilot`, `cursor`, `pi`, `omp`.** Deferred pending
+2. **Support for `copilot`, `cursor`, `omp`.** Deferred pending
    vendor-path verification.
 3. **Remote-runtime (k8s, ACP) skill delivery.** Deferred. Likely shape is
    a content-copy into the pod's workdir via a new runtime hook, not

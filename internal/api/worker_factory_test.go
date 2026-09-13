@@ -8,9 +8,11 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -18,10 +20,20 @@ func TestResolveWorkerSessionRuntimePreservesStoredResolvedCommandAndBackfillsCu
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "api-resume-anthropic-token")
 	t.Setenv("ANTHROPIC_BASE_URL", "https://process.example.test")
 	t.Setenv("OLLAMA_API_KEY", "api-resume-ollama-token")
+	t.Setenv("API_SESSION_WORKSPACE_VALUE", "expanded-workspace-value")
 	t.Setenv("GC_RIG", "caller-rig")
 	t.Setenv("GC_SESSION_NAME", "caller-session")
 
 	fs := newSessionFakeState(t)
+	fs.cfg.Workspace.Env = map[string]string{
+		"WORKSPACE_ONLY":         "$API_SESSION_WORKSPACE_VALUE",
+		"SESSION_ENV_PRECEDENCE": "workspace",
+		"GC_BIN":                 "/workspace/bin/gc",
+		"GC_CITY":                "/workspace/city",
+		// PR #4577 review (security major): a controller token configured via
+		// workspace env must be scrubbed from the resumed session env.
+		convergence.TokenEnvVar: "workspace-controller-token",
+	}
 	fs.cfg.Agents[0].Provider = "resolved-worker"
 	fs.cfg.Providers["resolved-worker"] = config.ProviderSpec{
 		DisplayName:       "Resolved Worker",
@@ -33,7 +45,13 @@ func TestResolveWorkerSessionRuntimePreservesStoredResolvedCommandAndBackfillsCu
 		ResumeCommand:     "resolved resume {{.SessionKey}}",
 		SessionIDFlag:     "--session-id-resolved",
 		Env: map[string]string{
-			"ANTHROPIC_BASE_URL": "https://resolved.example.test",
+			"ANTHROPIC_BASE_URL":     "https://resolved.example.test",
+			"SESSION_ENV_PRECEDENCE": "provider",
+			"GC_BIN":                 "/provider/bin/gc",
+			"GC_CITY":                "/provider/city",
+			// PR #4577 review (security major): a controller token configured via
+			// provider env must also be scrubbed from the resumed session env.
+			convergence.TokenEnvVar: "provider-controller-token",
 		},
 	}
 
@@ -95,6 +113,43 @@ func TestResolveWorkerSessionRuntimePreservesStoredResolvedCommandAndBackfillsCu
 	}
 	if runtimeCfg.SessionEnv["GC_CITY_RUNTIME_DIR"] == "" {
 		t.Error("SessionEnv[GC_CITY_RUNTIME_DIR] = empty, want set")
+	}
+	gcBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	for key, want := range map[string]string{
+		"WORKSPACE_ONLY":         "expanded-workspace-value",
+		"SESSION_ENV_PRECEDENCE": "provider",
+		"GC_BIN":                 gcBin,
+	} {
+		if got := runtimeCfg.SessionEnv[key]; got != want {
+			t.Errorf("SessionEnv[%s] = %q, want %q", key, got, want)
+		}
+		if got := runtimeCfg.Hints.Env[key]; got != want {
+			t.Errorf("Hints.Env[%s] = %q, want %q", key, got, want)
+		}
+	}
+	// PR #4577 review: the API resume path must (a) prepend the gc binary's dir
+	// to PATH so a bare `gc` in the resumed session resolves to this binary
+	// (behavioral-correctness major), and (b) scrub the controller token from
+	// both workspace and provider env layers (security major).
+	wantPATHPrefix := filepath.Dir(gcBin)
+	for name, env := range map[string]map[string]string{
+		"SessionEnv": runtimeCfg.SessionEnv,
+		"Hints.Env":  runtimeCfg.Hints.Env,
+	} {
+		parts := strings.Split(env["PATH"], string(os.PathListSeparator))
+		if len(parts) == 0 || parts[0] != wantPATHPrefix {
+			t.Errorf("%s[PATH] = %q, want first entry %q (dir of GC_BIN)", name, env["PATH"], wantPATHPrefix)
+		}
+		// Scrubbed means present-and-empty: the resumed session inherits the
+		// controller's environment, so an absent key is an inherited key.
+		if got, present := env[convergence.TokenEnvVar]; !present {
+			t.Errorf("%s omits %s; want present and empty", name, convergence.TokenEnvVar)
+		} else if got != "" {
+			t.Errorf("%s[%s] = %q, want empty", name, convergence.TokenEnvVar, got)
+		}
 	}
 	// Identity-only contract (per Copilot review): no dispatcher trace
 	// default — that must stay per-dispatcher-qualified, not reseeded
@@ -572,6 +627,58 @@ func TestResolveWorkerSessionRuntimeFallsBackToStoredCommandWhenTemplateOverride
 	}
 }
 
+// TestResolveWorkerSessionRuntimeResolvesMouseOnlyForInteractiveResume locks the
+// ga-c4w controller-poll-safety invariant on the API worker-factory resume seam
+// (regression ga-g7go): a resumed pool/headless agent must resolve mouse-OFF so
+// the tmux wheel never re-enables on a controller-polled session, while an
+// interactive (session_origin=manual) resume keeps mouse-ON — symmetric with the
+// create path's session_origin=="manual" gate in templateParamsToConfig. This
+// exercises the real resolveWorkerSessionRuntimeWithMetadata -> sessionResumeHints
+// chain wired as the worker factory's ResolveSessionRuntime, not a contrived stub
+// that dodges the worker-factory path.
+func TestResolveWorkerSessionRuntimeResolvesMouseOnlyForInteractiveResume(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		metadata    map[string]string
+		wantMouseOn bool
+	}{
+		{
+			name:        "pool agent resume stays mouse-off",
+			metadata:    map[string]string{"session_origin": "worker"},
+			wantMouseOn: false,
+		},
+		{
+			name:        "interactive resume keeps mouse-on",
+			metadata:    map[string]string{"agent_name": "myrig/worker", "session_origin": "manual"},
+			wantMouseOn: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newSessionFakeState(t)
+			fs.cfg.Providers["test-agent"] = config.ProviderSpec{
+				Command:   "/bin/echo",
+				PathCheck: "true",
+			}
+
+			srv := New(fs)
+			runtimeCfg, err := srv.resolveWorkerSessionRuntimeWithMetadata(session.Info{
+				Template: "myrig/worker",
+				Provider: "test-agent",
+				WorkDir:  t.TempDir(),
+			}, "", tc.metadata)
+			if err != nil {
+				t.Fatalf("resolveWorkerSessionRuntimeWithMetadata: %v", err)
+			}
+			if runtimeCfg == nil {
+				t.Fatal("resolveWorkerSessionRuntimeWithMetadata() = nil")
+			}
+			if got := runtimeCfg.Hints.MouseOn; got != tc.wantMouseOn {
+				t.Errorf("Hints.MouseOn = %v, want %v (poll-safety: mouse-on only for interactive resume)", got, tc.wantMouseOn)
+			}
+		})
+	}
+}
+
 func TestResolveWorkerSessionRuntimeUsesProviderACPDefaultWithoutTemplateSessionOverride(t *testing.T) {
 	supportsACP := true
 	fs := newSessionFakeState(t)
@@ -838,17 +945,8 @@ func TestWorkerFactorySessionByIDUsesResolvedTemplateRuntime(t *testing.T) {
 	}
 
 	srv := New(fs)
-	mgr := session.NewManager(fs.cityBeadStore, fs.sp)
-	info, err := mgr.CreateBeadOnly(
-		"myrig/worker",
-		"Chat",
-		"",
-		t.TempDir(),
-		"",
-		"",
-		nil,
-		session.ProviderResume{SessionIDFlag: "--stale-session-id"},
-	)
+	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{BeadOnly: true, Template: "myrig/worker", Title: "Chat", Command: "", WorkDir: t.TempDir(), Provider: "", Transport: "", Resume: session.ProviderResume{SessionIDFlag: "--stale-session-id"}})
 	if err != nil {
 		t.Fatalf("CreateBeadOnly: %v", err)
 	}
@@ -890,17 +988,8 @@ func TestWorkerFactorySessionByIDPreservesStoredResolvedCommand(t *testing.T) {
 	}
 
 	srv := New(fs)
-	mgr := session.NewManager(fs.cityBeadStore, fs.sp)
-	info, err := mgr.CreateBeadOnly(
-		"myrig/worker",
-		"Chat",
-		"/bin/echo --composed",
-		t.TempDir(),
-		"resolved-worker",
-		"",
-		nil,
-		session.ProviderResume{SessionIDFlag: "--stale-session-id"},
-	)
+	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{BeadOnly: true, Template: "myrig/worker", Title: "Chat", Command: "/bin/echo --composed", WorkDir: t.TempDir(), Provider: "resolved-worker", Transport: "", Resume: session.ProviderResume{SessionIDFlag: "--stale-session-id"}})
 	if err != nil {
 		t.Fatalf("CreateBeadOnly: %v", err)
 	}
@@ -938,22 +1027,13 @@ func TestWorkerFactorySessionByIDUsesResolvedCommandAndResumeSettingsOnResume(t 
 	}
 
 	srv := New(fs)
-	mgr := session.NewManager(fs.cityBeadStore, fs.sp)
-	info, err := mgr.Create(
-		context.Background(),
-		"myrig/worker",
-		"Chat",
-		"legacy-agent",
-		t.TempDir(),
-		"resolved-worker",
-		nil,
-		session.ProviderResume{
+	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	info, err := mgr.CreateSession(
+		context.Background(), session.CreateOptions{Template: "myrig/worker", Title: "Chat", Command: "legacy-agent", WorkDir: t.TempDir(), Provider: "resolved-worker", Env: nil, Resume: session.ProviderResume{
 			ResumeFlag:    "--old-resume",
 			ResumeStyle:   "flag",
 			SessionIDFlag: "--session-id-resolved",
-		},
-		runtime.Config{},
-	)
+		}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -992,21 +1072,12 @@ func TestWorkerFactorySessionByIDAppliesTemplateOverridesToExplicitResumeCommand
 	fs.cfg.Providers["resolved-worker"] = spec
 
 	srv := New(fs)
-	mgr := session.NewManager(fs.cityBeadStore, fs.sp)
-	info, err := mgr.Create(
-		context.Background(),
-		"myrig/worker",
-		"Chat",
-		"/bin/echo --skip-permissions",
-		t.TempDir(),
-		"resolved-worker",
-		nil,
-		session.ProviderResume{
+	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	info, err := mgr.CreateSession(
+		context.Background(), session.CreateOptions{Template: "myrig/worker", Title: "Chat", Command: "/bin/echo --skip-permissions", WorkDir: t.TempDir(), Provider: "resolved-worker", Env: nil, Resume: session.ProviderResume{
 			ResumeCommand: "/bin/echo resume {{.SessionKey}} --skip-permissions",
 			SessionIDFlag: "--session-id",
-		},
-		runtime.Config{},
-	)
+		}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1053,17 +1124,8 @@ func TestWorkerFactoryHandleForTargetUsesResolvedTemplateRuntimeForSessionMeta(t
 	}
 
 	srv := New(fs)
-	mgr := session.NewManager(fs.cityBeadStore, fs.sp)
-	info, err := mgr.CreateBeadOnly(
-		"myrig/worker",
-		"Chat",
-		"",
-		t.TempDir(),
-		"",
-		"",
-		nil,
-		session.ProviderResume{SessionIDFlag: "--stale-session-id"},
-	)
+	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{BeadOnly: true, Template: "myrig/worker", Title: "Chat", Command: "", WorkDir: t.TempDir(), Provider: "", Transport: "", Resume: session.ProviderResume{SessionIDFlag: "--stale-session-id"}})
 	if err != nil {
 		t.Fatalf("CreateBeadOnly: %v", err)
 	}
@@ -1223,5 +1285,70 @@ func TestWorkerFactoryRoutesWorkerOperationEventsToStateProvider(t *testing.T) {
 	last := recorded[len(recorded)-1]
 	if got, want := last.Type, events.WorkerOperation; got != want {
 		t.Fatalf("last event type = %q, want %q", got, want)
+	}
+}
+
+// The API builds a worker.Factory per request. The Server holds the
+// derived-activity memo those factories share, so a keyless zcode session's
+// State — polled by the session list, the agent-output read and the stream
+// prechecks — parses an unchanged mirror once, not once per request.
+func TestWorkerFactorySharesDerivedActivityMemoAcrossRequests(t *testing.T) {
+	fs := newSessionFakeState(t)
+	searchBase := t.TempDir()
+	srv := newServerWithSearchPaths(fs, searchBase)
+	workDir := t.TempDir()
+
+	factory, err := srv.workerFactory(fs.cityBeadStore)
+	if err != nil {
+		t.Fatalf("workerFactory: %v", err)
+	}
+	seat, err := factory.Session(worker.SessionSpec{
+		Profile:  worker.ProfileZCodeTmuxCLI,
+		Template: "myrig/worker",
+		Title:    "Probe",
+		Command:  "zcode-repl",
+		WorkDir:  workDir,
+		Provider: "zcode",
+	})
+	if err != nil {
+		t.Fatalf("factory.Session: %v", err)
+	}
+	if err := seat.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	started, err := seat.State(context.Background())
+	if err != nil {
+		t.Fatalf("State(started): %v", err)
+	}
+
+	scopeDir := filepath.Join(searchBase, sessionlog.ZCodeSeatMirrorScope(started.SessionName, started.SessionID, "1"))
+	if err := os.MkdirAll(scopeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", scopeDir, err)
+	}
+	mirror := `{"info":{"id":"sess_probe","directory":"` + filepath.ToSlash(workDir) + `"},"messages":[` +
+		`{"info":{"id":"m1","sessionID":"sess_probe","role":"user","parentID":"","time":{"created":1770000000000}},"parts":[{"id":"p1","type":"text","text":"go"}]}]}`
+	if err := os.WriteFile(filepath.Join(scopeDir, "sess_probe.json"), []byte(mirror), 0o644); err != nil {
+		t.Fatalf("write mirror: %v", err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		requestFactory, err := srv.workerFactory(fs.cityBeadStore)
+		if err != nil {
+			t.Fatalf("workerFactory(request %d): %v", i, err)
+		}
+		handle, err := requestFactory.SessionByID(started.SessionID)
+		if err != nil {
+			t.Fatalf("SessionByID(request %d): %v", i, err)
+		}
+		state, err := handle.State(context.Background())
+		if err != nil {
+			t.Fatalf("State(request %d): %v", i, err)
+		}
+		if state.Phase != worker.PhaseBusy {
+			t.Fatalf("State(request %d).Phase = %s, want %s", i, state.Phase, worker.PhaseBusy)
+		}
+	}
+	if got := srv.activityMemo.Derivations(); got != 1 {
+		t.Fatalf("unchanged mirror parsed %d times across 3 per-request factories, want 1", got)
 	}
 }

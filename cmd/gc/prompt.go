@@ -24,19 +24,22 @@ const (
 
 // PromptContext holds template data for prompt rendering.
 type PromptContext struct {
-	CityRoot      string
-	AgentName     string // qualified: "rig/polecat-1" or "mayor"
-	TemplateName  string // config name: "polecat" (template) or "mayor" (named backing template)
-	BindingName   string
-	BindingPrefix string
-	RigName       string
-	RigRoot       string
-	WorkDir       string
-	IssuePrefix   string
-	Branch        string
-	DefaultBranch string // e.g. "main" — from git symbolic-ref origin/HEAD
-	WorkQuery     string // command to find available work (from Agent.EffectiveWorkQuery)
-	SlingQuery    string // command template to route work to this agent (from Agent.EffectiveSlingQuery)
+	CityRoot                string
+	AgentName               string // qualified: "rig/polecat-1" or "mayor"
+	TemplateName            string // config name: "polecat" (template) or "mayor" (named backing template)
+	BindingName             string
+	BindingPrefix           string
+	RigName                 string
+	RigRoot                 string
+	WorkDir                 string
+	IssuePrefix             string
+	Branch                  string
+	DefaultBranch           string // e.g. "main" — from git symbolic-ref origin/HEAD
+	WorkQuery               string // command to find available work (from Agent.EffectiveWorkQuery)
+	AssignedInProgressQuery string // command to find assigned in-progress work (from Agent.EffectiveAssignedInProgressQuery)
+	AssignedReadyQuery      string // command to find pre-assigned ready work (from Agent.EffectiveAssignedReadyQuery)
+	RoutedPoolQuery         string // command to find unassigned routed pool work (from Agent.EffectiveRoutedPoolQuery)
+	SlingQuery              string // command template to route work to this agent (from Agent.EffectiveSlingQuery)
 	// ProviderKey is the resolved provider name for this agent (e.g. "claude",
 	// "codex", or a custom provider name from the city's [providers] section).
 	// Templates can branch on this via {{ .ProviderKey }} or feed it to
@@ -54,7 +57,26 @@ type PromptContext struct {
 	// Templates use {{ .InstructionsFile }} as a provider-aware fallback when
 	// pack-specific guidance (e.g. quality-gate commands) is missing or empty.
 	InstructionsFile string
-	Env              map[string]string // from Agent.Env — custom vars
+	// ConfigDir is the directory the agent's config-relative paths (e.g.
+	// pre-start scripts) resolve against: Agent.SourceDir when set, else
+	// cityPath. Mirrors SessionSetupContext.ConfigDir (cmd/gc/pool.go).
+	ConfigDir string
+	Env       map[string]string // from Agent.Env — custom vars
+}
+
+// resolveConfigDir returns the directory an agent's config-relative paths
+// (pre-start scripts, session setup templates) resolve against: sourceDir
+// when the agent overrides it (imported-pack agents), else cityPath.
+// Shared by every site that populates ConfigDir on a PromptContext or
+// SessionSetupContext, so the resolution rule can't drift between them
+// (#5315). Note that sessionSetupContextForAgent (cmd/gc/cmd_start.go)
+// leaves ConfigDir zero for its rig-only callers; worker_handle.go patches
+// it via this helper.
+func resolveConfigDir(cityPath, sourceDir string) string {
+	if sourceDir != "" {
+		return sourceDir
+	}
+	return cityPath
 }
 
 // PromptRenderResult holds the rendered text plus the version and rendered
@@ -124,12 +146,21 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
 	// Load shared templates from pack dirs (lower priority).
 	// Each pack directory may contain prompts/shared/ and/or
 	// template-fragments/ subdirectories.
+	loadedPackFragmentRoots := make(map[string]struct{}, len(packDirs)+1)
 	for _, dir := range packDirs {
+		cleanDir := filepath.Clean(dir)
+		loadedPackFragmentRoots[cleanDir] = struct{}{}
 		sharedDir := filepath.Join(dir, "prompts", "shared")
 		loadSharedTemplates(fs, tmpl, sharedDir, stderr)
 		// V2: template-fragments/ at pack level.
 		fragDir := filepath.Join(dir, "template-fragments")
 		loadSharedTemplates(fs, tmpl, fragDir, stderr)
+	}
+	if sourcePackRoot := promptSourcePackRoot(cityPath, sourcePath); sourcePackRoot != "" {
+		if _, ok := loadedPackFragmentRoots[sourcePackRoot]; !ok {
+			loadSharedTemplates(fs, tmpl, filepath.Join(sourcePackRoot, "prompts", "shared"), stderr)
+			loadSharedTemplates(fs, tmpl, filepath.Join(sourcePackRoot, "template-fragments"), stderr)
+		}
 	}
 
 	// Load shared templates from the city root itself. cfg.PackDirs is
@@ -206,6 +237,21 @@ func promptTemplateSourcePath(cityPath, templatePath string) string {
 		return templatePath
 	}
 	return filepath.Join(cityPath, templatePath)
+}
+
+func promptSourcePackRoot(cityPath, sourcePath string) string {
+	cleanCityPath := filepath.Clean(cityPath)
+	cleanSourcePath := filepath.Clean(sourcePath)
+	agentDir := filepath.Dir(cleanSourcePath)
+	agentsDir := filepath.Dir(agentDir)
+	if filepath.Base(agentsDir) != "agents" {
+		return ""
+	}
+	packRoot := filepath.Clean(filepath.Dir(agentsDir))
+	if packRoot == cleanCityPath {
+		return ""
+	}
+	return packRoot
 }
 
 func isCanonicalPromptTemplatePath(path string) bool {
@@ -288,7 +334,7 @@ func effectivePromptFragments(global, inject, appendFragments, inherited, defaul
 // buildTemplateData merges Env (lower priority) with SDK fields (higher
 // priority) into a single map for template execution.
 func buildTemplateData(ctx PromptContext) map[string]string {
-	m := make(map[string]string, len(ctx.Env)+10)
+	m := make(map[string]string, len(ctx.Env)+20)
 	for k, v := range ctx.Env {
 		m[k] = v
 	}
@@ -299,16 +345,21 @@ func buildTemplateData(ctx PromptContext) map[string]string {
 	m["BindingName"] = ctx.BindingName
 	m["BindingPrefix"] = ctx.BindingPrefix
 	m["RigName"] = ctx.RigName
+	m["Rig"] = ctx.RigName // {{.Rig}} contract alias (config.go); matches work_dir/work_query rendering
 	m["RigRoot"] = ctx.RigRoot
 	m["WorkDir"] = ctx.WorkDir
 	m["IssuePrefix"] = ctx.IssuePrefix
 	m["Branch"] = ctx.Branch
 	m["DefaultBranch"] = ctx.DefaultBranch
 	m["WorkQuery"] = ctx.WorkQuery
+	m["AssignedInProgressQuery"] = ctx.AssignedInProgressQuery
+	m["AssignedReadyQuery"] = ctx.AssignedReadyQuery
+	m["RoutedPoolQuery"] = ctx.RoutedPoolQuery
 	m["SlingQuery"] = ctx.SlingQuery
 	m["ProviderKey"] = ctx.ProviderKey
 	m["ProviderDisplayName"] = ctx.ProviderDisplayName
 	m["InstructionsFile"] = ctx.InstructionsFile
+	m["ConfigDir"] = ctx.ConfigDir
 	return m
 }
 

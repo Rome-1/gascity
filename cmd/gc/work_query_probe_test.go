@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +9,6 @@ import (
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
-	"github.com/gastownhall/gascity/internal/pgauth"
 )
 
 func TestPrefixedWorkQueryForProbe_UsesNamedSessionRuntimeName(t *testing.T) {
@@ -31,8 +29,21 @@ func TestPrefixedWorkQueryForProbe_UsesNamedSessionRuntimeName(t *testing.T) {
 	}
 
 	command := prefixedWorkQueryForProbe(cfg, cityPath, "test-city", nil, nil, &cfg.Agents[0], nil)
-	if !strings.Contains(command, "for key in gc.run_target gc.routed_to") || !strings.Contains(command, "-- demo/witness") {
+	if !strings.Contains(command, `bd ready --metadata-field "gc.routed_to=$target"`) || !strings.Contains(command, "-- demo/witness") {
 		t.Fatalf("prefixedWorkQueryForProbe() = %q, want demo/witness route argument", command)
+	}
+}
+
+func TestPrefixedWorkQueryForProbeUsesBD105WorkQuery(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Beads:     config.BeadsConfig{BDCompatibility: config.BeadsBDCompatibility105},
+		Agents:    []config.Agent{{Name: "worker"}},
+	}
+
+	command := prefixedWorkQueryForProbeWithEnv(nil, cfg, t.TempDir(), cfg.Workspace.Name, nil, nil, &cfg.Agents[0], nil)
+	if !strings.Contains(command, "bd ready --include-ephemeral") {
+		t.Fatalf("prefixedWorkQueryForProbeWithEnv() = %q, want bd-1.0.5 ephemeral-ready probe", command)
 	}
 }
 
@@ -60,12 +71,11 @@ func TestControllerQueryRuntimeEnvInheritedRigUsesCityStorePassword(t *testing.T
 	}
 }
 
-func TestControllerQueryRuntimeEnvSurfacesPostgresProjectionError(t *testing.T) {
-	clearAmbientPostgresEnv(t)
+func TestControllerQueryRuntimeEnvRefusesAnUnregisteredBackend(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 
 	cityPath := t.TempDir()
-	writePGScopeFixture(t, cityPath, "")
+	writeUnregisteredBackendMetadata(t, cityPath)
 	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte(`issue_prefix: city
 gc.endpoint_origin: managed_city
 gc.endpoint_status: verified
@@ -76,12 +86,7 @@ dolt.auto-start: false
 	cfg := &config.City{Agents: []config.Agent{{Name: "agent"}}}
 
 	_, err := controllerQueryRuntimeEnv(cityPath, cfg, &cfg.Agents[0])
-	if err == nil {
-		t.Fatal("controllerQueryRuntimeEnv() error = nil, want postgres projection error")
-	}
-	if !errors.Is(err, pgauth.ErrNoPasswordResolvable) {
-		t.Fatalf("errors.Is(err, ErrNoPasswordResolvable) = false, want true; err=%v", err)
-	}
+	assertRefusesUnregisteredBackend(t, err)
 }
 
 func TestControllerQueryRuntimeEnvExplicitRigUsesRigStorePassword(t *testing.T) {

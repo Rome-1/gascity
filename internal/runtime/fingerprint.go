@@ -36,15 +36,32 @@ type BreakdownCopyEntry struct {
 // different prefix) and silently rebaseline them instead of triggering a
 // false-positive drain. Bump this constant whenever the inputs to or the
 // algorithm of any Fingerprint helper change.
-const FingerprintVersion = "v3"
+//
+// v4: .gc/settings.json is no longer probed in CopyFiles; its fingerprint
+// contribution is path-based only. Content changes to the managed runtime
+// settings file no longer trigger stale-session cascades. (ga-zfm)
+//
+// v5: operational/host-tooling scripts (city-*.sh, update-*.sh) are excluded
+// from the .gc/scripts probed CopyFiles content hash. Editing such a script no
+// longer flips every agent's fingerprint into a fleet-wide config-drift drain.
+// The bump rebaselines existing v4 hashes silently instead of draining the
+// fleet once on rollout. (#3840)
+//
+// v6: operator-authored config env (workspace/provider/agent/rig-patch env,
+// captured before passthrough/credentials/generated values are merged) gets
+// its own dedicated Launch-tier identity field (Config.OperatorEnv), separate
+// from Env and FingerprintExtra (Option A', ga-3a42sp). The bump rebaselines
+// existing v5 hashes silently rather than draining the fleet. (ga-i91hrn)
+const FingerprintVersion = "v6"
 
 // ConfigFingerprint returns a deterministic hash of the Config fields that
 // define an agent's behavioral identity. Changes to these fields indicate
 // the agent should be restarted (via drain when drain ops are available).
 //
-// Included: Command, Lifecycle, Env, FingerprintExtra (pool config, etc.),
-// PreStart, SessionSetup, SessionSetupScript, OverlayDir, effective provider
-// overlay slots, CopyFiles, AcceptStartupDialogs, MouseOn, SessionLive.
+// Included: Command, Lifecycle, Env, OperatorEnv (config-authored env
+// identity), FingerprintExtra (pool config, etc.), PreStart, SessionSetup,
+// SessionSetupScript, OverlayDir, effective provider overlay slots, CopyFiles,
+// AcceptStartupDialogs, MouseOn, SessionLive.
 //
 // Excluded (observation-only hints): WorkDir, ReadyPromptPrefix,
 // ReadyDelayMs, ProcessNames, EmitsPermissionWarning.
@@ -259,6 +276,40 @@ func hashCoreFields(h hash.Hash, cfg Config) {
 			h.Write([]byte{0})         //nolint:errcheck // separator between entries
 		}
 	}
+
+	// Upstream (Phase C — the model-serving selection identity). LAUNCH-half:
+	// also hashed by hashLaunchFields, so switching upstream relaunches the agent
+	// in the warm box (B2.3) rather than reprovisioning. The resolved serving env
+	// (ANTHROPIC_*) lives in Env and is NOT hashed (the allow-list excludes it),
+	// so a credential rotation moves no fingerprint. Optional/conditional, so an
+	// unset Upstream leaves every existing config's fingerprint byte-identical.
+	hashOptionalString(h, "upstream", cfg.Upstream)
+
+	// OperatorEnv (Option A', ga-3a42sp — config-authored env identity).
+	// LAUNCH-half: also hashed by hashLaunchFields, so a config-authored env
+	// change relaunches the agent in the warm box rather than reprovisioning.
+	// Prefixed with "operator_env" so its framing cannot collide with the
+	// FingerprintExtra map hashed above, even when both carry the same
+	// key/value pairs. Conditional, so an empty/nil OperatorEnv leaves every
+	// existing config's fingerprint byte-identical.
+	if len(cfg.OperatorEnv) > 0 {
+		h.Write([]byte("operator_env")) //nolint:errcheck // hash.Write never errors
+		h.Write([]byte{0})              //nolint:errcheck // hash.Write never errors
+		hashSortedMap(h, cfg.OperatorEnv)
+	}
+}
+
+// hashOptionalString contributes name+value to the hash only when value is
+// non-empty, so adding a new optional string field leaves the fingerprint of
+// every config that does not set it byte-identical (no FingerprintVersion bump).
+func hashOptionalString(h hash.Hash, name, value string) {
+	if value == "" {
+		return
+	}
+	h.Write([]byte(name))  //nolint:errcheck // hash.Write never errors
+	h.Write([]byte{0})     //nolint:errcheck // hash.Write never errors
+	h.Write([]byte(value)) //nolint:errcheck // hash.Write never errors
+	h.Write([]byte{0})     //nolint:errcheck // hash.Write never errors
 }
 
 func hashOptionalBool(h hash.Hash, name string, value *bool) {

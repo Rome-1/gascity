@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"syscall"
 	"testing"
@@ -118,18 +117,19 @@ func TestRunDoltCleanupRejectsNegativeMaxOrphanDBs(t *testing.T) {
 
 func TestRunDoltCleanup_JSONOutputsResolvedPort(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
 
 	rigs := []resolverRig{{Name: "hq", Path: "/city", HQ: true}}
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
-		Flag:     "",
-		CityPort: 0,
-		Rigs:     rigs,
-		FS:       fs,
-		JSON:     true,
-		Probe:    false, // skip TCP probe in unit tests
+		Flag:        "",
+		CityPort:    0,
+		Rigs:        rigs,
+		FS:          fs,
+		CityPath:    "/city",
+		LiveResolve: fakeLiveResolve(),
+		JSON:        true,
+		Probe:       false, // skip TCP probe in unit tests
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -176,16 +176,17 @@ func TestRunDoltCleanup_HumanOutputShowsPortAndFallbackWarning(t *testing.T) {
 
 func TestRunDoltCleanup_FlagOverridesEverything(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
-		Flag:     "9999",
-		CityPort: 4242,
-		Rigs:     []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
-		FS:       fs,
-		JSON:     true,
-		Probe:    false,
+		Flag:        "9999",
+		CityPort:    4242,
+		Rigs:        []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
+		FS:          fs,
+		CityPath:    "/city",
+		LiveResolve: fakeLiveResolve(),
+		JSON:        true,
+		Probe:       false,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -362,36 +363,25 @@ func TestRunDoltCleanup_InvalidCityConfigPortIsFatal(t *testing.T) {
 	}
 }
 
-func TestRunDoltCleanup_BadRigPortFileIsFatal(t *testing.T) {
+func TestRunDoltCleanup_LiveResolutionErrorIsFatal(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
-		setup     func(*fsys.Fake)
+		resolve   func(string) (liveDoltPortResolution, error)
 		wantError string
 	}{
 		{
-			name:      "empty",
-			setup:     func(fs *fsys.Fake) { fs.Files["/city/.beads/dolt-server.port"] = []byte("\n") },
-			wantError: "empty",
+			name:      "ambiguous listeners",
+			resolve:   fakeLiveResolveError("ambiguous live dolt listeners for /city on ports [28231 29000]; pass --port to disambiguate"),
+			wantError: "ambiguous",
 		},
 		{
-			name:      "malformed",
-			setup:     func(fs *fsys.Fake) { fs.Files["/city/.beads/dolt-server.port"] = []byte("not-a-port\n") },
-			wantError: "invalid port",
-		},
-		{
-			name:      "out of range",
-			setup:     func(fs *fsys.Fake) { fs.Files["/city/.beads/dolt-server.port"] = []byte("70000\n") },
-			wantError: "65535",
-		},
-		{
-			name:      "unreadable",
-			setup:     func(fs *fsys.Fake) { fs.Errors["/city/.beads/dolt-server.port"] = os.ErrPermission },
-			wantError: "permission",
+			name:      "discovery failure",
+			resolve:   fakeLiveResolveError("discover dolt processes: ps exploded"),
+			wantError: "ps exploded",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := fsys.NewFake()
-			tc.setup(fs)
 			client := &fakeCleanupDoltClient{
 				databases: []string{"testdb_abc"},
 			}
@@ -399,11 +389,13 @@ func TestRunDoltCleanup_BadRigPortFileIsFatal(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			opts := cleanupOptions{
-				Rigs:       []resolverRig{{Name: "city", Path: "/city", HQ: true}},
-				FS:         fs,
-				JSON:       true,
-				Force:      true,
-				DoltClient: client,
+				Rigs:        []resolverRig{{Name: "city", Path: "/city", HQ: true}},
+				FS:          fs,
+				CityPath:    "/city",
+				LiveResolve: tc.resolve,
+				JSON:        true,
+				Force:       true,
+				DoltClient:  client,
 				DiscoverProcesses: func() ([]DoltProcInfo, error) {
 					return []DoltProcInfo{{PID: 4444, Argv: []string{"dolt", "sql-server", "--config", "/tmp/TestX/config.yaml"}}}, nil
 				},
@@ -415,7 +407,7 @@ func TestRunDoltCleanup_BadRigPortFileIsFatal(t *testing.T) {
 			}
 			code := runDoltCleanup(opts, &stdout, &stderr)
 			if code == 0 {
-				t.Fatalf("exit=0, want bad rig port file to fail closed\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+				t.Fatalf("exit=0, want live resolution error to fail closed\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
 			}
 
 			var r CleanupReport
@@ -423,10 +415,10 @@ func TestRunDoltCleanup_BadRigPortFileIsFatal(t *testing.T) {
 				t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
 			}
 			if len(client.dropped) != 0 {
-				t.Fatalf("DropDatabase called after bad rig port file: %v", client.dropped)
+				t.Fatalf("DropDatabase called after live resolution error: %v", client.dropped)
 			}
 			if len(killed) != 0 {
-				t.Fatalf("KillProcess called after bad rig port file: %v", killed)
+				t.Fatalf("KillProcess called after live resolution error: %v", killed)
 			}
 			if r.Port.Resolved != 0 {
 				t.Fatalf("Port.Resolved = %d, want 0 for unresolved fatal port", r.Port.Resolved)
@@ -438,7 +430,7 @@ func TestRunDoltCleanup_BadRigPortFileIsFatal(t *testing.T) {
 				}
 			}
 			if !foundPortError {
-				t.Fatalf("Errors missing fatal rig port-file entry containing %q: %+v", tc.wantError, r.Errors)
+				t.Fatalf("Errors missing fatal live-resolution entry containing %q: %+v", tc.wantError, r.Errors)
 			}
 		})
 	}
@@ -483,6 +475,64 @@ func TestRunDoltCleanup_ForceDoesNotProtectLegacyFallbackPort(t *testing.T) {
 	}
 	if len(signals) != 1 || signals[0] != syscall.SIGTERM {
 		t.Fatalf("signals = %v, want legacy fallback process to stay eligible for SIGTERM", signals)
+	}
+}
+
+func TestRunDoltCleanup_ForceReapsBareDeletedCwd(t *testing.T) {
+	// The highest-stakes new behavior (ga-10wmzh): a bare `dolt sql-server`
+	// (no --config) whose working directory is an unlinked inode was always
+	// protected before this change and is now reaped under --force. Drive it
+	// through the real SIGTERM→SIGKILL revalidation path and assert the signal
+	// ordering, the empty-ConfigPath revalidation contract, and that exactly
+	// one process was reaped.
+	var signals []syscall.Signal
+	proc := DoltProcInfo{
+		PID:            5150,
+		Argv:           []string{"dolt", "sql-server"},
+		CWDState:       procPathStateDeleted,
+		StartTimeTicks: 42,
+	}
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		FS:      fsys.NewFake(),
+		JSON:    true,
+		Force:   true,
+		HomeDir: "/home/u",
+		DiscoverProcesses: func() ([]DoltProcInfo, error) {
+			return []DoltProcInfo{proc}, nil
+		},
+		KillProcess: func(_ int, sig syscall.Signal) error {
+			signals = append(signals, sig)
+			return nil
+		},
+		ReapGracePeriod: 1,
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+	if len(signals) != 2 || signals[0] != syscall.SIGTERM || signals[1] != syscall.SIGKILL {
+		t.Fatalf("signals = %v, want [SIGTERM SIGKILL] for bare deleted-cwd reap", signals)
+	}
+	if r.Reaped.Count != 1 {
+		t.Errorf("Reaped.Count = %d, want 1", r.Reaped.Count)
+	}
+	if len(r.Reaped.Targets) != 1 || r.Reaped.Targets[0].PID != proc.PID {
+		t.Fatalf("Reaped.Targets = %+v, want one target PID %d", r.Reaped.Targets, proc.PID)
+	}
+	if r.Reaped.Targets[0].ConfigPath != "" {
+		t.Errorf("ConfigPath = %q, want empty for bare server", r.Reaped.Targets[0].ConfigPath)
+	}
+	if !strings.Contains(r.Reaped.Targets[0].Reason, "deleted") {
+		t.Errorf("Reason = %q, want deleted-cwd reason", r.Reaped.Targets[0].Reason)
+	}
+	if len(r.Reaped.ProtectedPIDs) != 0 {
+		t.Errorf("ProtectedPIDs = %v, want none", r.Reaped.ProtectedPIDs)
 	}
 }
 
@@ -580,7 +630,6 @@ func TestRunDoltCleanup_RigsProtectedFromRegistry(t *testing.T) {
 
 func TestRunDoltCleanup_DryRunReportsReapPlanWithoutKilling(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
 
 	procs := []DoltProcInfo{
 		{PID: 1138290, Ports: []int{28231}, Argv: []string{"dolt", "sql-server"}},
@@ -656,7 +705,6 @@ func TestRunDoltCleanup_DryRunAllowsProcessTempRootTestConfig(t *testing.T) {
 
 func TestRunDoltCleanup_ForceKillsOrphans(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
 
 	procs := []DoltProcInfo{
 		{PID: 1138290, Ports: []int{28231}, Argv: []string{"dolt", "sql-server"}, StartTimeTicks: 10},
@@ -830,18 +878,19 @@ func TestRunDoltCleanup_ForceCountsPostSIGTERMGoneAsReaped(t *testing.T) {
 
 func TestRunDoltCleanup_ForceRevalidatesPIDBeforeSIGTERM(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
 
 	discoverCalls := 0
 	var signals []syscall.Signal
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
-		Rigs:    []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
-		FS:      fs,
-		JSON:    true,
-		Force:   true,
-		HomeDir: "/home/u",
+		Rigs:        []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
+		FS:          fs,
+		CityPath:    "/city",
+		LiveResolve: fakeLiveResolve(),
+		JSON:        true,
+		Force:       true,
+		HomeDir:     "/home/u",
 		DiscoverProcesses: func() ([]DoltProcInfo, error) {
 			discoverCalls++
 			if discoverCalls == 1 {
@@ -1042,18 +1091,19 @@ func TestRunDoltCleanup_ForceSkipsSIGKILLWhenRevalidationDiscoverErrors(t *testi
 
 func TestRunDoltCleanup_ForceSkipsSIGKILLWhenProcessBecomesProtected(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
 
 	discoverCalls := 0
 	var signals []syscall.Signal
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
-		Rigs:    []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
-		FS:      fs,
-		JSON:    true,
-		Force:   true,
-		HomeDir: "/home/u",
+		Rigs:        []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
+		FS:          fs,
+		CityPath:    "/city",
+		LiveResolve: fakeLiveResolve(),
+		JSON:        true,
+		Force:       true,
+		HomeDir:     "/home/u",
 		DiscoverProcesses: func() ([]DoltProcInfo, error) {
 			discoverCalls++
 			proc := DoltProcInfo{
@@ -1187,6 +1237,65 @@ func TestRunDoltCleanup_RigsProtectedReadsDoltDatabaseFromMetadata(t *testing.T)
 		if r.RigsProtected[i] != w {
 			t.Errorf("RigsProtected[%d] = %+v, want %+v", i, r.RigsProtected[i], w)
 		}
+	}
+}
+
+func TestRunDoltCleanup_SkipsNonDoltBackedRig(t *testing.T) {
+	// az-374: a rig whose metadata.json declares a non-dolt backend (e.g.
+	// mysql) has no dolt database for dolt-cleanup to verify, drop, or purge.
+	// It MUST be skipped — excluded from rigs_protected and never counted as a
+	// rig-protection force_blocker — rather than being treated as one for
+	// lacking dolt_database. A dolt-backed rig in the same city is unaffected.
+	fs := fsys.NewFake()
+	fs.Files["/city/.beads/metadata.json"] = []byte(`{"backend":"mysql","database":"anthony_beads"}`)
+	fs.Files["/rigs/doltrig/.beads/metadata.json"] = []byte(`{"dolt_database":"doltrig_db"}`)
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		Rigs: []resolverRig{
+			{Name: "city", Path: "/city", HQ: true},
+			{Name: "doltrig", Path: "/rigs/doltrig"},
+		},
+		FS:                fs,
+		JSON:              true,
+		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+
+	// The mysql-backed rig must not trip rig-protection.
+	if len(r.ForceBlockers) != 0 {
+		t.Fatalf("ForceBlockers = %+v, want none (mysql-backed rig must be skipped)", r.ForceBlockers)
+	}
+	if hasRigProtectionError(&r) {
+		t.Fatalf("unexpected rig-protection error; mysql-backed rig must be skipped: %+v", r.Errors)
+	}
+	if r.Summary.ErrorsTotal != 0 {
+		t.Fatalf("Summary.ErrorsTotal = %d, want 0; errors=%+v", r.Summary.ErrorsTotal, r.Errors)
+	}
+
+	// The mysql-backed rig is skipped (absent from rigs_protected); the
+	// dolt-backed rig is still protected with its metadata dolt_database.
+	for _, rp := range r.RigsProtected {
+		if rp.Rig == "city" {
+			t.Errorf("mysql-backed rig 'city' must be skipped, but found in RigsProtected: %+v", rp)
+		}
+	}
+	want := CleanupRigProtection{Rig: "doltrig", DB: "doltrig_db"}
+	found := false
+	for _, rp := range r.RigsProtected {
+		if rp == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("dolt-backed rig %+v missing from RigsProtected; got %+v", want, r.RigsProtected)
 	}
 }
 
@@ -1475,4 +1584,255 @@ func equalIntSlice(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+func TestRunDoltCleanup_DryRunReportsDeletedScopeTargets(t *testing.T) {
+	// Deleted-scope servers (ga-10wmzh): reaping requires the deleted-cwd
+	// signal. A bare server with a deleted cwd reaps, and a configured server
+	// whose cwd is unlinked reaps with its --config echoed. A server whose
+	// --config has merely vanished while its cwd is still live is protected
+	// (the missing-config signal alone is not proof of scope deletion), as is
+	// a fully live external server. The JSON envelope carries each reap reason.
+	procs := []DoltProcInfo{
+		{
+			PID:      6201,
+			Argv:     []string{"dolt", "sql-server", "-H", "127.0.0.1", "-P", "33420"},
+			CWDState: procPathStateDeleted,
+		},
+		{
+			PID:             6202,
+			Argv:            []string{"dolt", "sql-server", "--config", "/data/worktrees/gone/.gc/runtime/packs/dolt/dolt-config.yaml"},
+			CWDState:        procPathStateDeleted,
+			ConfigPathState: procPathStateDeleted,
+		},
+		{
+			PID:             6203,
+			Argv:            []string{"dolt", "sql-server", "--config", "/var/lib/external-app/dolt-config.yaml"},
+			CWDState:        procPathStateLive,
+			ConfigPathState: procPathStateLive,
+		},
+		{
+			PID:             6204,
+			Argv:            []string{"dolt", "sql-server", "--config", "/data/worktrees/maybe-gone/.gc/runtime/packs/dolt/dolt-config.yaml"},
+			CWDState:        procPathStateLive,
+			ConfigPathState: procPathStateDeleted,
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		FS:                fsys.NewFake(),
+		JSON:              true,
+		HomeDir:           "/home/u",
+		DiscoverProcesses: func() ([]DoltProcInfo, error) { return procs, nil },
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+
+	if len(r.Reaped.Targets) != 2 {
+		t.Fatalf("Reaped.Targets = %+v, want the two deleted-cwd PIDs", r.Reaped.Targets)
+	}
+	if r.Reaped.Targets[0].PID != 6201 || r.Reaped.Targets[0].Reason == "" {
+		t.Errorf("Targets[0] = %+v, want PID 6201 with a deleted-cwd reason", r.Reaped.Targets[0])
+	}
+	if r.Reaped.Targets[1].PID != 6202 || r.Reaped.Targets[1].Reason == "" {
+		t.Errorf("Targets[1] = %+v, want PID 6202 with a deleted-cwd reason", r.Reaped.Targets[1])
+	}
+	if r.Reaped.Targets[1].ConfigPath != "/data/worktrees/gone/.gc/runtime/packs/dolt/dolt-config.yaml" {
+		t.Errorf("Targets[1].ConfigPath = %q, want the config echoed", r.Reaped.Targets[1].ConfigPath)
+	}
+	if !equalIntSlice(r.Reaped.ProtectedPIDs, []int{6203, 6204}) {
+		t.Errorf("ProtectedPIDs = %v, want [6203 6204] (live external + missing-config-but-live-cwd both protected)", r.Reaped.ProtectedPIDs)
+	}
+}
+
+func TestRunDoltCleanup_ForceRemovesDataDirAfterConfirmedKill(t *testing.T) {
+	// ga-ntbpyb.2 acceptance criterion 1: a confirmed-orphan dolt process
+	// (bare server, --data-dir on the test-config-path allowlist) has its
+	// data directory removed once its kill is confirmed.
+	proc := DoltProcInfo{
+		PID:            7301,
+		Argv:           []string{"dolt", "sql-server", "--data-dir", "/tmp/TestDataDir1/dolt-data"},
+		StartTimeTicks: 5,
+	}
+	var removed []string
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		FS:      fsys.NewFake(),
+		JSON:    true,
+		Force:   true,
+		HomeDir: "/home/u",
+		DiscoverProcesses: func() ([]DoltProcInfo, error) {
+			return []DoltProcInfo{proc}, nil
+		},
+		KillProcess: func(_ int, _ syscall.Signal) error {
+			return syscall.ESRCH // already gone by the time we signal
+		},
+		RemoveDataDir: func(path string) error {
+			removed = append(removed, path)
+			return nil
+		},
+		ReapGracePeriod: 1,
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+	if r.Reaped.Count != 1 {
+		t.Errorf("Reaped.Count = %d, want 1", r.Reaped.Count)
+	}
+	if len(removed) != 1 || removed[0] != "/tmp/TestDataDir1/dolt-data" {
+		t.Fatalf("RemoveDataDir calls = %v, want exactly one call for /tmp/TestDataDir1/dolt-data", removed)
+	}
+	if len(r.Reaped.Targets) != 1 || r.Reaped.Targets[0].DataDir != "/tmp/TestDataDir1/dolt-data" {
+		t.Fatalf("Reaped.Targets = %+v, want DataDir echoed in the report", r.Reaped.Targets)
+	}
+}
+
+func TestRunDoltCleanup_DryRunDoesNotRemoveDataDir(t *testing.T) {
+	proc := DoltProcInfo{
+		PID:  7302,
+		Argv: []string{"dolt", "sql-server", "--data-dir", "/tmp/TestDataDir2/dolt-data"},
+	}
+	var removed []string
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		FS:      fsys.NewFake(),
+		JSON:    true,
+		HomeDir: "/home/u",
+		// Force not set → dry-run: the plan (including DataDir) is reported
+		// but nothing is signaled or removed.
+		DiscoverProcesses: func() ([]DoltProcInfo, error) {
+			return []DoltProcInfo{proc}, nil
+		},
+		RemoveDataDir: func(path string) error {
+			removed = append(removed, path)
+			return nil
+		},
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+	if len(removed) != 0 {
+		t.Fatalf("RemoveDataDir calls = %v, want none in dry-run", removed)
+	}
+	if len(r.Reaped.Targets) != 1 || r.Reaped.Targets[0].DataDir != "/tmp/TestDataDir2/dolt-data" {
+		t.Fatalf("Reaped.Targets = %+v, want DataDir still visible in the dry-run plan", r.Reaped.Targets)
+	}
+}
+
+func TestRunDoltCleanup_ForceSkipsDataDirRemovalWhenTargetBecomesProtected(t *testing.T) {
+	// Mirrors TestRunDoltCleanup_ForceSkipsSIGKILLWhenProcessBecomesProtected:
+	// if revalidation discovers the target is no longer eligible for reap
+	// before SIGKILL (here, it starts serving a protected rig port), the kill
+	// is never confirmed — so DataDir removal must not run either.
+	fs := fsys.NewFake()
+	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")
+
+	discoverCalls := 0
+	var removed []string
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		Rigs:    []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
+		FS:      fs,
+		JSON:    true,
+		Force:   true,
+		HomeDir: "/home/u",
+		DiscoverProcesses: func() ([]DoltProcInfo, error) {
+			discoverCalls++
+			proc := DoltProcInfo{
+				PID:            4445,
+				Argv:           []string{"dolt", "sql-server", "--data-dir", "/tmp/TestDataDir3/dolt-data"},
+				StartTimeTicks: 10,
+			}
+			if discoverCalls >= 3 {
+				proc.Ports = []int{28231}
+			}
+			return []DoltProcInfo{proc}, nil
+		},
+		KillProcess: func(_ int, _ syscall.Signal) error { return nil },
+		RemoveDataDir: func(path string) error {
+			removed = append(removed, path)
+			return nil
+		},
+		ReapGracePeriod: 1,
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+	if r.Reaped.Count != 0 {
+		t.Errorf("Reaped.Count = %d, want 0 because SIGKILL was skipped", r.Reaped.Count)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("RemoveDataDir calls = %v, want none for a target that became protected before its kill was confirmed", removed)
+	}
+}
+
+func TestRunDoltCleanup_ForceDataDirRemovalErrorIsRecorded(t *testing.T) {
+	proc := DoltProcInfo{
+		PID:            7303,
+		Argv:           []string{"dolt", "sql-server", "--data-dir", "/tmp/TestDataDir4/dolt-data"},
+		StartTimeTicks: 5,
+	}
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		FS:      fsys.NewFake(),
+		JSON:    true,
+		Force:   true,
+		HomeDir: "/home/u",
+		DiscoverProcesses: func() ([]DoltProcInfo, error) {
+			return []DoltProcInfo{proc}, nil
+		},
+		KillProcess: func(_ int, _ syscall.Signal) error {
+			return syscall.ESRCH
+		},
+		RemoveDataDir: func(string) error {
+			return fmt.Errorf("permission denied")
+		},
+		ReapGracePeriod: 1,
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+	if r.Reaped.Count != 1 {
+		t.Errorf("Reaped.Count = %d, want 1: a failed data-dir removal must not un-confirm an already-confirmed kill", r.Reaped.Count)
+	}
+	if r.Summary.ErrorsTotal != 1 {
+		t.Errorf("Summary.ErrorsTotal = %d, want 1", r.Summary.ErrorsTotal)
+	}
+	if len(r.Errors) != 1 || r.Errors[0].Stage != "reap" || !strings.Contains(r.Errors[0].Error, "permission denied") {
+		t.Fatalf("Errors = %+v, want one reap-stage data-dir removal error", r.Errors)
+	}
+	if len(r.Reaped.Errors) == 0 {
+		t.Errorf("Reaped.Errors empty; want the data-dir removal failure recorded")
+	}
 }

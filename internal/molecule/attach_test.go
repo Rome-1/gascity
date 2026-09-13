@@ -175,6 +175,52 @@ func TestAttachToWorkflowRoot(t *testing.T) {
 	assertBlockingDep(t, store, root.ID, result.RootID)
 }
 
+// TestAttachResolvesRootFromRunChainNotOwnID is the regression for the
+// maintainer-city grafted-wisp incident (gcg-wisp-y785sz). A wisp/source bead
+// grafted mid-workflow carries the true top workflow root in its run-chain
+// metadata (workflow_id / molecule_id, written by sling) but NOT its own
+// gc.root_bead_id. The old Attach fallback checked only gc.root_bead_id and
+// then defaulted to the parent's own id, stamping the whole sub-DAG (attempt
+// container, scope-check, every child) with the WRONG root. Downstream
+// reconciliation then enumerated siblings via beads.DirectMembers(<wrong root>),
+// found the wrong set, and burned ralph attempts until abort_scope fired on
+// green work. Attach must resolve the root through the canonical run chain
+// (beadmeta.ResolveRunID), never the parent's own id.
+func TestAttachResolvesRootFromRunChainNotOwnID(t *testing.T) {
+	store := beads.NewMemStore()
+
+	// The true top workflow root.
+	root := setupWorkflow(t, store)
+
+	// A wisp/source bead grafted mid-workflow: it carries the true root in the
+	// run chain (workflow_id) but has no gc.root_bead_id of its own.
+	wisp, err := store.Create(beads.Bead{
+		Title: "grafted wisp",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":     "wisp",
+			"workflow_id": root.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create grafted wisp: %v", err)
+	}
+
+	recipe := makeWorkflowRecipe("sub-work", "run", "eval")
+
+	result, err := Attach(context.Background(), store, recipe, wisp.ID, AttachOptions{})
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	// The sub-DAG must be rooted at the TRUE workflow root from the run chain,
+	// never at the grafted wisp's own id.
+	if result.WorkflowRootID != root.ID {
+		t.Errorf("WorkflowRootID = %q, want %q (true root from run chain, not the wisp's own id %q)", result.WorkflowRootID, root.ID, wisp.ID)
+	}
+	assertAllBeadsHaveRootID(t, store, result.IDMapping, root.ID)
+}
+
 // Test 3: Blocking dep prevents premature unblock
 func TestAttachBlockingDepPreventsClose(t *testing.T) {
 	store := beads.NewMemStore()
@@ -482,6 +528,56 @@ func TestAttachIdempotency(t *testing.T) {
 	if len(allAfter) != countBefore {
 		t.Errorf("bead count changed: %d → %d (expected no change)", countBefore, len(allAfter))
 	}
+}
+
+func TestAttachIdempotencyFindsEphemeralExistingRoot(t *testing.T) {
+	store := beads.NewMemStore()
+	root := setupWorkflow(t, store)
+	control := setupWorkflowChild(t, store, root.ID, "Control")
+	existingRoot, err := store.Create(beads.Bead{
+		Title:     "attempt",
+		Type:      "task",
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.kind":            "workflow",
+			"gc.idempotency_key": "attempt:1",
+			"gc.root_bead_id":    root.ID,
+			"gc.step_ref":        "attempt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create existing ephemeral root: %v", err)
+	}
+	existingRun, err := store.Create(beads.Bead{
+		Title:     "run",
+		Type:      "task",
+		Ephemeral: true,
+		ParentID:  existingRoot.ID,
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "attempt.run",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create existing ephemeral child: %v", err)
+	}
+
+	result, err := Attach(context.Background(), store, makeWorkflowRecipe("attempt", "run"), control.ID, AttachOptions{
+		IdempotencyKey: "attempt:1",
+	})
+	if err != nil {
+		t.Fatalf("Attach duplicate: %v", err)
+	}
+	if !result.Duplicate {
+		t.Fatal("Attach duplicate should report Duplicate for ephemeral existing root")
+	}
+	if result.RootID != existingRoot.ID {
+		t.Fatalf("RootID = %q, want existing ephemeral root %q", result.RootID, existingRoot.ID)
+	}
+	if result.IDMapping["attempt"] != existingRoot.ID || result.IDMapping["attempt.run"] != existingRun.ID {
+		t.Fatalf("IDMapping = %#v, want existing ephemeral root and child", result.IDMapping)
+	}
+	assertBlockingDep(t, store, control.ID, existingRoot.ID)
 }
 
 // Test 13: Different idempotency keys create separate sub-DAGs

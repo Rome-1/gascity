@@ -1,5 +1,5 @@
 ---
-title: Dolt Bloat Recovery
+title: Recover from Dolt Bloat
 description: Recover a Gas City beads store whose Dolt noms directory has grown out of proportion.
 ---
 
@@ -34,7 +34,7 @@ and verifying the result.
 - **Free disk space.** Dolt GC rewrites chunks into a new store before
   swapping; budget at least **2× the current `.dolt/` size** in free space
   on the same filesystem.
-- **Final Dolt 2.0.7 or newer.** This matches the floor enforced by Gas
+- **Final Dolt 2.1.0 or newer.** This matches the floor enforced by Gas
   City's managed Dolt tooling. Releases before 1.86.2 also have the upstream
   GC/writer deadlock fixed in dolthub/dolt commit `ccf7bde206`, which can hang
   `dolt_backup sync` under heavy write load. Check with
@@ -68,6 +68,94 @@ If `gc doctor` reports a clean `dolt-noms-size` and agents come back up
 cleanly, the recovery is complete. You may delete the `.dolt.bak-*`
 directory at your leisure once you are confident in the new store.
 
+## Reclaiming a database stranded below the compaction threshold
+
+`gc dolt compact` skips any database with fewer commits than the threshold
+(default 2000, `GC_DOLT_COMPACT_THRESHOLD_COMMITS`). A database can fall *below*
+that threshold yet still carry orphaned chunks — most commonly after a prior
+flatten squashed its history but the post-flatten full GC was deferred (a
+concurrent writer raced the flatten), quarantined and later cleared, or
+otherwise never completed. Scheduled compaction then skips the database forever
+and the space is never reclaimed. The skip is visible in the compactor log as:
+
+```
+compact: db=<database> commits=<n> below_threshold=<t> oldgen_archives=present pending_gc=absent — skip ...
+```
+
+Use the operator-invoked reclaim path to recover such a database without waiting
+for its commit count to climb back over the threshold:
+
+```bash
+# Reclaim one stranded database. Runs CALL DOLT_GC('--full') with no flatten,
+# bypassing the commit-count threshold.
+gc dolt compact --gc-only --only-db <database>
+
+# Preview first, mutating nothing.
+gc dolt compact --gc-only --only-db <database> --dry-run
+```
+
+`--gc-only` refuses any database under an integrity-quarantine marker; resolve
+the underlying reason (see **Compact Quarantine Reasons** below) before
+reclaiming. Unlike the full `dolt gc --archive-level=1` procedure above,
+`--gc-only` runs against the live managed server and does not require stopping
+the city — though quiescing writers still makes the GC faster and more
+thorough.
+
+## Compacting a city whose Dolt remote is uncredentialed
+
+Before flattening (and again before pushing) the compactor runs
+`CALL DOLT_FETCH('<remote>')` to reconcile against the remote. Against an
+**uncredentialed git+https remote**, that call does not merely return an error —
+it **crashes the managed Dolt sql-server process**. The shell tolerates a
+non-zero return code ("proceeding from local source of truth") but cannot catch
+a server-process death across the process boundary: the supervisor restarts the
+server seconds later, but by then every remaining database's probe hits
+`connection refused`, so one misconfigured remote takes down compaction for the
+whole city.
+
+If a city's remote is not (yet) credentialed, opt out of the fetch so
+compaction runs entirely from the local source of truth. The post-compaction
+remote push is deferred via a pending-push marker and resumes automatically on a
+later run once the fetch path is healthy:
+
+```bash
+# Skip the fetch for every database this run.
+gc dolt compact --skip-fetch
+
+# Equivalent environment opt-out (e.g. set in a wrapper or on the city).
+GC_DOLT_COMPACT_SKIP_FETCH=1 gc dolt compact
+
+# Skip the fetch only for specific, known-uncredentialed databases (CSV);
+# credentialed databases in the same city still fetch and push normally.
+GC_DOLT_COMPACT_SKIP_FETCH_DBS=<database>[,<database>...] gc dolt compact
+```
+
+Prefer the per-database `GC_DOLT_COMPACT_SKIP_FETCH_DBS` form over the global
+opt-out when only some databases are uncredentialed — the global form disables
+remote sync for every database, including ones whose push would otherwise
+succeed. Do **not** set the global opt-out in the shared `mol-dog-compactor`
+order for the same reason; set the per-database env on the affected city
+instead.
+
+## Compacting a database that must never reach a remote
+
+Some databases are deliberately local — a privacy boundary, or a store whose
+remote was configured by accident. Mark those `.no-sync` and compaction skips
+its remote phase entirely: no fetch, no push, and no deferred push recorded.
+The database still flattens and GCs, so it keeps the disk benefit:
+
+```bash
+# Exclude one database from all remote sync, compaction included.
+touch <cityPath>/.beads/dolt/<database>/.no-sync
+```
+
+`gc dolt sync` and `gc dolt pull` honor the same marker, so one file covers
+every remote path.
+
+Choose `.no-sync` over `--skip-fetch` when a database must never reach a
+remote. `--skip-fetch` defers the push and waits for the remote to become
+usable later; `.no-sync` states that it never will.
+
 ## Expected Outcome
 
 DoltHub's archive format typically delivers ~30% compression on top of
@@ -82,7 +170,7 @@ If GC finishes but the size barely moves, the chunks are nearly all live
 
 ## Prevention
 
-- **Keep Dolt at a final 2.0.7 or newer.** This matches Gas City's
+- **Keep Dolt at a final 2.1.0 or newer.** This matches Gas City's
   managed-Dolt floor; newer releases ship improved auto-GC heuristics and
   default archive compression.
 - **Let the dolt pack's `mol-dog-compactor` order run continuously.**
@@ -118,14 +206,56 @@ should treat these strings as the current vocabulary:
 | `post-flatten row count decreased` | A table lost rows after flatten. |
 | `post-flatten row count probe failed` | The post-flatten row-count query failed or returned a non-number. |
 | `post-flatten table value hash probe failed` | A post-flatten table hash query failed or returned empty. |
-| `post-flatten table value hash changed with row-count increase` | A table gained rows and its value hash changed. |
-| `post-flatten table value hash changed without row-count increase` | A table's value hash changed without a row-count gain. |
+| `post-flatten table value hash changed with row-count increase` | A table gained rows and its value hash changed. *(auto-clearable — see below)* |
+| `post-flatten table value hash changed without row-count increase` | A table's value hash changed without a row-count gain. *(auto-clearable — see below)* |
 | `post-flatten table list changed` | A table appeared or an invalid table name was observed after preflight. |
 | `post-flatten table list probe failed` | The post-flatten `information_schema.tables` query failed. |
 | `post-flatten value hash probe failed` | The database hash query failed after flatten. |
 | `post-flatten value hash probe returned empty value` | The database hash query returned an empty value after flatten. |
-| `post-flatten value hash changed with row-count increase` | The database hash changed after at least one stable-table row-count gain. |
-| `post-flatten value hash changed without row-count increase` | The database hash changed without a row-count gain. |
+| `post-flatten value hash changed with row-count increase` | The database hash changed after at least one stable-table row-count gain. *(auto-clearable — see below)* |
+| `post-flatten value hash changed without row-count increase` | The database hash changed without a row-count gain. *(auto-clearable — see below)* |
+
+Four of these reasons are known writer-race false positives and are
+**auto-clearable**. On its next scheduled run, `gc dolt compact`'s flatten
+path re-proves content preservation with a fresh
+`DOLT_DIFF_STAT(<marker flatten_preflight_head>, <current HEAD>)`: every
+drifted table must report `rows_deleted=0` and `rows_modified=0`, and the
+drift must stay confined to that proved set. On success compact removes the
+marker, emits the usual alert and event, and continues through flatten and
+full GC in the same cycle. Any probe failure, deleted or modified row, drift
+outside the proved set, or any other reason keeps the marker and blocks GC.
+You do not need to clear these by hand — check the compactor log first.
+
+Quarantine markers also carry structured evidence. New markers include the
+database name, the preflight/flatten/post-verify HEADs, preflight and
+postflight database value hashes when available, `integrity_table_drift` for
+table-level row/hash mismatches, `database_value_hash_drift` for aggregate hash
+drift, and `decision=preserve_marker_manual_review_required`.
+
+Safe marker-clear procedure:
+
+1. Require a clean application worktree: `git status --short` should show no
+   product/config/test changes you have not accounted for.
+2. Confirm the Dolt server is reachable with `gc dolt status` and a live query
+   such as `gc dolt sql --db <database> -q "SELECT COUNT(*) FROM issues"`.
+3. Confirm bead queries are healthy for the affected store, for example
+   `bd list --limit 1` in that rig or `gc bd list --rig <rig> --limit 1`.
+4. Read the marker and retain it if the HEAD/hash/table evidence is incomplete
+   or points at row loss. For table drift, compare the recorded HEADs with
+   `DOLT_DIFF` / `DOLT_DIFF_STAT`; only clear when the diff proves preflight
+   rows are still reachable and no unexpected table disappeared.
+5. When the evidence proves no data loss, remove only that database's marker:
+   `rm .gc/runtime/packs/dolt/compact-quarantine/<database>`.
+6. Retry reclaim with `gc dolt compact --gc-only --only-db <database>`. If the
+   marker returns or health checks fail, preserve the marker and escalate with
+   the marker contents and command output.
+
+`gc dolt compact --gc-only` and the bare-GC path refuse databases with
+quarantine markers unconditionally. The scheduled `gc dolt compact` flatten
+path also refuses, except for the four auto-clearable reasons above, which it
+may clear on its own after proving content preservation. The refusal output
+repeats the marker path, reason, key evidence fields, and the clear/retry
+command so operators have the next action without opening this runbook first.
 
 ## When to Escalate
 

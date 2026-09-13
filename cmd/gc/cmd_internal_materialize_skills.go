@@ -26,6 +26,7 @@ func newInternalCmd(stdout, stderr io.Writer) *cobra.Command {
 	}
 	cmd.AddCommand(newInternalMaterializeSkillsCmd(stdout, stderr))
 	cmd.AddCommand(newInternalProjectMCPCmd(stdout, stderr))
+	cmd.AddCommand(newInternalBeadsCredentialCmd(stdout, stderr))
 	return cmd
 }
 
@@ -40,6 +41,7 @@ func newInternalCmd(stdout, stderr io.Writer) *cobra.Command {
 // build desired set → materialize. Never invoked by humans directly.
 func newInternalMaterializeSkillsCmd(stdout, stderr io.Writer) *cobra.Command {
 	var agentName, workdir, sharedCatalogSnapshot, sharedCatalogSnapshotFile string
+	var bestEffort bool
 	cmd := &cobra.Command{
 		Use:    "materialize-skills",
 		Short:  "Materialize skills for one agent into one workdir",
@@ -56,16 +58,35 @@ func newInternalMaterializeSkillsCmd(stdout, stderr io.Writer) *cobra.Command {
 			}
 			cityPath, err := resolveCity()
 			if err != nil {
+				if bestEffort {
+					fmt.Fprintf(stderr, "gc internal materialize-skills: city not found: %v; skipping (best-effort)\n", err) //nolint:errcheck // best-effort stderr
+					return nil
+				}
 				fmt.Fprintf(stderr, "gc internal materialize-skills: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
 			cfg, err := loadCityConfig(cityPath, stderr)
 			if err != nil {
+				if bestEffort {
+					fmt.Fprintf(stderr, "gc internal materialize-skills: city config unavailable: %v; skipping (best-effort)\n", err) //nolint:errcheck // best-effort stderr
+					return nil
+				}
 				fmt.Fprintf(stderr, "gc internal materialize-skills: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
 			agent, ok := resolveAgentIdentity(cfg, agentName, currentRigContext(cfg))
 			if !ok {
+				if bestEffort {
+					// Named/wisp session expansions pass a session identity
+					// (e.g. "rig/executor-vc-eswi4") that can't be resolved back
+					// to a config template. Skills materialization is best-effort
+					// session preparation, not a hard prerequisite, so in
+					// best-effort mode (the pre_start caller) warn and exit 0
+					// rather than failing the whole session start (the session
+					// runs without a freshly materialized skill catalog).
+					fmt.Fprintf(stderr, "gc internal materialize-skills: unknown agent %q; skipping (best-effort)\n", agentName) //nolint:errcheck // best-effort stderr
+					return nil
+				}
 				fmt.Fprintf(stderr, "gc internal materialize-skills: unknown agent %q\n", agentName) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
@@ -106,7 +127,7 @@ func newInternalMaterializeSkillsCmd(stdout, stderr io.Writer) *cobra.Command {
 				}
 			}
 
-			if err := materializeSkillsIntoWorkdir(cfg, &agent, workdir, sharedCatalog, stdout, stderr); err != nil {
+			if err := materializeSkillsIntoWorkdir(cfg, &agent, cityPath, workdir, sharedCatalog, stdout, stderr); err != nil {
 				return errExit
 			}
 			return nil
@@ -116,6 +137,7 @@ func newInternalMaterializeSkillsCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&workdir, "workdir", "", "agent working directory (skills materialize into workdir/.<vendor>/skills/)")
 	cmd.Flags().StringVar(&sharedCatalogSnapshot, "shared-catalog-snapshot", "", "base64-encoded shared catalog snapshot from the controller")
 	cmd.Flags().StringVar(&sharedCatalogSnapshotFile, "shared-catalog-snapshot-file", "", "path to a file containing the base64-encoded shared catalog snapshot (preferred over --shared-catalog-snapshot for large catalogs to avoid argv/env limits)")
+	cmd.Flags().BoolVar(&bestEffort, "best-effort", false, "warn and exit 0 instead of failing when city path, city config, or agent identity can't be resolved; used by pre_start so session startup is non-fatal when city state is transiently unavailable (dirty import cache, missing city.toml) or the session identity can't be matched to a config template")
 	return cmd
 }
 
@@ -139,7 +161,7 @@ func decodeSharedCatalogSnapshot(encoded string) (materialize.CityCatalog, error
 	return cat, nil
 }
 
-func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, workdir string, sharedCatalog *materialize.CityCatalog, stdout, stderr io.Writer) error {
+func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, cityPath, workdir string, sharedCatalog *materialize.CityCatalog, stdout, stderr io.Writer) error {
 	if cfg == nil || agent == nil {
 		fmt.Fprintln(stderr, "gc internal materialize-skills: missing city config or agent") //nolint:errcheck // best-effort stderr
 		return errExit
@@ -189,10 +211,11 @@ func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, workdir
 	}
 
 	res, err := materialize.Run(materialize.Request{
-		SinkDir:     filepath.Join(absWorkdir, vendorSink),
-		Desired:     desired,
-		OwnedRoots:  owned,
-		LegacyNames: materialize.LegacyStubNames(),
+		SinkDir:          filepath.Join(absWorkdir, vendorSink),
+		Desired:          desired,
+		OwnedRoots:       owned,
+		LegacyNames:      materialize.LegacyStubNames(),
+		LegacyOwnedRoots: materialize.LegacyOwnedRootsFor(cityPath),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "gc internal materialize-skills: %v\n", err) //nolint:errcheck // best-effort stderr

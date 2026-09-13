@@ -13,27 +13,32 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
-// loadRigDoltPorts reads each rig's <rigRoot>/.beads/dolt-server.port file and
-// returns a port→rig-name map for the reaper's protection check. Missing or
-// malformed files are silently skipped — they just won't contribute to the
-// protected set, and the reaper will fall back to its config-path filter.
+// recordedScopeDoltPorts reads each scope's .beads/dolt-server.port. It exists
+// solely as the degraded-mode fallback in protectedDoltPortsForReap, for the
+// window where live resolution returns nothing at all.
 //
-// If two rigs claim the same port (pathological — operator misconfiguration),
-// the later-listed rig wins. The function is still safe: any port match
-// protects, regardless of which rig name is attributed.
-func loadRigDoltPorts(rigs []resolverRig, fs fsys.FS) map[int]string {
+// Deliberately NOT a second source of truth. Live state wins whenever it has an
+// answer; this never selects a reap target, never overrides a live attribution,
+// and is not consulted when liveResolve succeeds. The file is a managed-local
+// compatibility mirror of the canonical managed port (writeDoltPortFile), so on
+// a healthy city it merely restates what live resolution already reported.
+//
+// Unparseable or malformed files are skipped: they contribute nothing, which
+// leaves the reaper exactly where it would be without this fallback. If two
+// scopes claim the same port (operator misconfiguration), the later-listed one
+// wins the label — harmless, since any match protects regardless of which name
+// is attributed.
+func recordedScopeDoltPorts(rigs []resolverRig, fs fsys.FS) map[int]string {
 	out := map[int]string{}
+	if fs == nil {
+		return out
+	}
 	for _, rig := range rigs {
-		path := filepath.Join(rig.Path, ".beads", "dolt-server.port")
-		data, err := fs.ReadFile(path)
+		data, err := fs.ReadFile(filepath.Join(rig.Path, ".beads", "dolt-server.port"))
 		if err != nil {
 			continue
 		}
-		text := strings.TrimSpace(string(data))
-		if text == "" {
-			continue
-		}
-		port, err := strconv.Atoi(text)
+		port, err := strconv.Atoi(strings.TrimSpace(string(data)))
 		if err != nil || !validDoltPort(port) {
 			continue
 		}
@@ -42,9 +47,71 @@ func loadRigDoltPorts(rigs []resolverRig, fs fsys.FS) map[int]string {
 	return out
 }
 
+// doltProcRigOwner reports which registered rig owns a discovered dolt
+// sql-server process, matched by the process's --data-dir or --config argv
+// path sitting under the rig root. This is the live-state replacement for
+// the former <rigRoot>/.beads/dolt-server.port protection read (city-scale
+// plan P1.7): a status file can lie about a rig's port, but a live process
+// whose data lives under the rig root cannot.
+//
+// If two rigs both contain a candidate path (nested roots — operator
+// misconfiguration), the first-listed rig wins. The reaper is still safe:
+// any match protects, regardless of which rig name is attributed.
+func doltProcRigOwner(p DoltProcInfo, rigs []resolverRig) (string, bool) {
+	var candidates []string
+	if cfg := extractConfigPath(p.Argv); cfg != "" {
+		candidates = append(candidates, cfg)
+	}
+	if dd, ok := argvFlagValue(p.Argv); ok && dd != "" {
+		candidates = append(candidates, dd)
+	}
+	if len(candidates) == 0 {
+		return "", false
+	}
+	for _, rig := range rigs {
+		root := normalizePathForCompare(strings.TrimSpace(rig.Path))
+		if root == "" || root == "." || root == string(filepath.Separator) {
+			continue
+		}
+		for _, candidate := range candidates {
+			if pathUnderRoot(candidate, root) {
+				return rig.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// pathUnderRoot reports whether path equals root or sits underneath it,
+// using the same normalization as samePath.
+//
+// PRECONDITION: root must already be normalized by the caller via
+// normalizePathForCompare; only path is normalized here. This is deliberate,
+// not an oversight — pathUnderRoot is called in the inner loop of a
+// process x rig cross product (doltProcRigOwner), where each rig root is
+// otherwise re-normalized once per candidate path of every discovered
+// process. Callers normalize the root once per rig instead. Passing a raw,
+// unnormalized root silently under-matches (protecting nothing), so any new
+// caller must normalize first.
+func pathUnderRoot(path, root string) bool {
+	normalized := normalizePathForCompare(path)
+	if normalized == "" {
+		return false
+	}
+	if normalized == root {
+		return true
+	}
+	return strings.HasPrefix(normalized, root+string(filepath.Separator))
+}
+
 // procEnumerationTimeout caps the per-PID I/O during /proc walks so a stuck
 // kernel thread or hung process can't make the reaper hang.
-const procEnumerationTimeout = 2 * time.Second
+const procEnumerationTimeout = 5 * time.Second
+
+// psEnumerationTimeout caps the wall-clock budget for the full-system ps -ax
+// invocation on Darwin/macOS. ps -ax can take 2–5 s on a busy machine; it
+// needs a much larger budget than the per-PID procEnumerationTimeout.
+const psEnumerationTimeout = 30 * time.Second
 
 // discoverDoltProcesses finds live `dolt sql-server` processes and reports
 // their argv and listening ports. Linux uses /proc for argv, ports, RSS, and
@@ -72,11 +139,14 @@ func discoverDoltProcesses() ([]DoltProcInfo, error) {
 			continue
 		}
 		out = append(out, DoltProcInfo{
-			PID:            pid,
-			Argv:           argv,
-			Ports:          pidPorts[pid],
-			RSSBytes:       readProcRSSBytes(pid),
-			StartTimeTicks: readProcStartTimeTicks(pid),
+			PID:              pid,
+			Argv:             argv,
+			Ports:            pidPorts[pid],
+			RSSBytes:         readProcRSSBytes(pid),
+			StartTimeTicks:   readProcStartTimeTicks(pid),
+			CWDState:         doltProcCWDState(pid),
+			ConfigPathState:  doltConfigPathState(argv),
+			ContainerRuntime: doltProcContainerRuntime(pid),
 		})
 	}
 	return out, nil
@@ -94,9 +164,165 @@ func discoverDoltProcessesFromPS() ([]DoltProcInfo, error) {
 		if !ok {
 			continue
 		}
+		// No /proc on this host, so CWDState stays unknown (protect-leaning),
+		// but the --config path can still be checked on disk.
+		proc.ConfigPathState = doltConfigPathState(proc.Argv)
 		out = append(out, proc)
 	}
 	return out, nil
+}
+
+// cwdStateFromLink classifies a /proc/<pid>/cwd readlink target, given the
+// procfs cwd link path (cwdLink) so the one ambiguous case can be resolved by
+// inode identity. The kernel appends " (deleted)" when the working directory
+// inode has been unlinked; that marker normally proves the scope is gone. It
+// is ambiguous only when a *live* directory's real name ends in " (deleted)",
+// which yields an identical readlink target. To tell them apart, treat the
+// readlink text as a literal path and compare its inode with the procfs cwd
+// link: when they are the same file the directory is live. A path that merely
+// contains "(deleted)" mid-string (e.g. "x (deleted) suffix") never matches
+// the suffix and stays live without any stat.
+//
+// Disambiguation fails closed. deleted is returned only on definitive evidence
+// that the cwd inode is unlinked: either the literal path does not exist
+// (a clean not-exist error) or it exists as a different inode than the process
+// cwd. Any non-definitive stat error or timeout — permission denied, an I/O
+// error, or a hung NFS/FUSE mount — returns unknown so that ambiguous
+// filesystem evidence can never authorize a destructive force-mode reap. The
+// stat calls are bounded by procEnumerationTimeout, matching statConfigPathState.
+func cwdStateFromLink(link, cwdLink string) string {
+	if !strings.HasSuffix(link, " (deleted)") {
+		return procPathStateLive
+	}
+	linkInfo, err := statWithTimeout(link)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// The literal path does not exist, so the suffix is the kernel's
+			// unlinked marker rather than part of a real directory name: the
+			// cwd inode is definitively gone.
+			return procPathStateDeleted
+		}
+		// Permission, I/O, or timeout: not definitive proof of an unlinked cwd,
+		// so fail closed to protect rather than reap on a transient error.
+		return procPathStateUnknown
+	}
+	cwdInfo, err := statWithTimeout(cwdLink)
+	if err != nil {
+		// The literal path exists but the process cwd could not be resolved to
+		// compare inodes; without that proof, fail closed to protect.
+		return procPathStateUnknown
+	}
+	if os.SameFile(linkInfo, cwdInfo) {
+		return procPathStateLive
+	}
+	// The literal path resolves to a different inode than the process cwd, so
+	// the cwd's " (deleted)" suffix is the genuine kernel unlinked marker.
+	return procPathStateDeleted
+}
+
+// statWithTimeout stats path under procEnumerationTimeout so a config or cwd on
+// a hung NFS/FUSE mount cannot stall the discovery walk. A timeout surfaces as
+// context.DeadlineExceeded (not a not-exist error), which callers treat as a
+// non-definitive failure and fail closed to protect. The abandoned goroutine
+// cannot leak a send (the channel is buffered), matching readWithTimeout's
+// fail-closed posture for /proc reads.
+func statWithTimeout(path string) (os.FileInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), procEnumerationTimeout)
+	defer cancel()
+	type result struct {
+		info os.FileInfo
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		info, err := os.Stat(path)
+		ch <- result{info, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.info, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// doltProcCWDState resolves /proc/<pid>/cwd and classifies the target.
+// Returns unknown when the host has no /proc, the process is gone, or the
+// readlink fails — classification treats unknown as protect.
+func doltProcCWDState(pid int) string {
+	if pid <= 0 {
+		return procPathStateUnknown
+	}
+	cwdLink := filepath.Join("/proc", strconv.Itoa(pid), "cwd")
+	link, err := os.Readlink(cwdLink)
+	if err != nil {
+		return procPathStateUnknown
+	}
+	return cwdStateFromLink(link, cwdLink)
+}
+
+// doltProcContainerRuntime reports the container runtime managing pid, by
+// scanning every line of /proc/<pid>/cgroup for that runtime's cgroup path
+// markers. Both the systemd-driver shapes (`libpod-<id>.scope`,
+// `docker-<id>.scope`, used by cgroup v2 and v1-with-systemd) and the
+// cgroupfs-driver shape `/docker/<id>` (emitted by cgroup v1, which carries no
+// `docker-` marker at all) are matched, and every line is checked because
+// cgroup v1 emits one line per controller in no guaranteed order. Returns ""
+// for a normal host process, a process whose cgroup can't be read (host with
+// no /proc, timeout, permission), or cgroup lines that carry no marker —
+// classifyDoltProcess treats "" as no signal (ga-sm1cvj).
+func doltProcContainerRuntime(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	data, err := readWithTimeout(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return ""
+	}
+	return containerRuntimeFromCgroup(data)
+}
+
+// containerRuntimeFromCgroup is doltProcContainerRuntime's pure parser over
+// raw /proc/<pid>/cgroup content, split out so the marker matching is
+// testable without a live container.
+func containerRuntimeFromCgroup(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		switch {
+		case strings.Contains(line, "libpod-"):
+			return "podman"
+		case strings.Contains(line, "docker-"), strings.Contains(line, "/docker/"):
+			return "docker"
+		}
+	}
+	return ""
+}
+
+// doltConfigPathState classifies the --config path from a dolt sql-server
+// argv: deleted when an absolute config path no longer exists on disk, live
+// when it does, unknown for absent or relative configs and for stat errors
+// other than not-exist (e.g. permission) so classification degrades toward
+// protection. The path is extracted from an arbitrary process's argv and may
+// live on a slow or hung NFS/FUSE mount, so the existence probe is bounded by
+// the same deadline used for /proc reads and fails closed to unknown.
+func doltConfigPathState(argv []string) string {
+	cfg := extractConfigPath(argv)
+	if cfg == "" || !filepath.IsAbs(cfg) {
+		return procPathStateUnknown
+	}
+	return statConfigPathState(cfg)
+}
+
+// statConfigPathState stats cfg under procEnumerationTimeout. A definitive
+// not-exist yields the deleted signal; any other error or a timeout degrades
+// to unknown so a blocking mount can never hang cleanup or drive a reap.
+func statConfigPathState(cfg string) string {
+	if _, err := statWithTimeout(cfg); err != nil {
+		if os.IsNotExist(err) {
+			return procPathStateDeleted
+		}
+		return procPathStateUnknown
+	}
+	return procPathStateLive
 }
 
 func discoverActiveTestRoots(homeDir, tempDir string) []string {
@@ -168,6 +394,13 @@ func activeTestRootFromPath(path, homeDir, tempDir string) (string, bool) {
 	clean := filepath.Clean(path)
 	for _, root := range []string{"/tmp", tempDir} {
 		if testRoot, ok := activeTestRootUnder(clean, root, testConfigPathPrefixes()); ok {
+			return testRoot, true
+		}
+	}
+	// Mirror isTestConfigPath's fleet GOTMPDIR roots: a root that is
+	// reapable when orphaned must also be protectable while its test runs.
+	for _, root := range []string{"/var/tmp/gotmp", os.Getenv("GOTMPDIR")} {
+		if testRoot, ok := activeTestRootUnder(clean, root, []string{"Test"}); ok {
 			return testRoot, true
 		}
 	}
@@ -276,10 +509,20 @@ func readDoltSQLServerArgv(pid int) ([]string, bool) {
 	return argv, true
 }
 
+// psOutputFormat is the -o field spec passed to `ps` for process discovery.
+// Deliberately excludes rss=: some macOS hosts require an entitlement to
+// report resource-usage fields (%mem/vsz/rss/time) for processes outside the
+// caller's own session, and ps exits non-zero for the *entire* invocation
+// when it can't — turning a clean, zero-orphan scan into a reported
+// dolt-cleanup reap-stage error (gastownhall/gascity#5201). RSSBytes is
+// cosmetic-only downstream (planOrphanReap classifies purely on
+// ConfigPath/DataDir/CWDState, never on RSS), so it is not worth requesting.
+const psOutputFormat = "pid=,lstart=,command="
+
 func psLStartCommandLines() ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), procEnumerationTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), psEnumerationTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,rss=,lstart=,command=")
+	cmd := exec.CommandContext(ctx, "ps", "-ax", "-o", psOutputFormat)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -294,17 +537,13 @@ func psLStartCommandLines() ([]string, error) {
 }
 
 func parseDoltPSLine(line string, pidPorts map[int][]int) (DoltProcInfo, bool) {
-	fields, command := consumeLeadingFields(line, 7)
-	if len(fields) != 7 || command == "" {
+	fields, command := consumeLeadingFields(line, 6)
+	if len(fields) != 6 || command == "" {
 		return DoltProcInfo{}, false
 	}
 	pid, err := strconv.Atoi(fields[0])
 	if err != nil || pid <= 0 {
 		return DoltProcInfo{}, false
-	}
-	rssKB, err := strconv.ParseInt(fields[1], 10, 64)
-	if err != nil || rssKB < 0 {
-		rssKB = 0
 	}
 	argv := parseDoltPSCommandLine(command)
 	if !looksLikeDoltSQLServer(argv) {
@@ -314,13 +553,12 @@ func parseDoltPSLine(line string, pidPorts map[int][]int) (DoltProcInfo, bool) {
 		PID:           pid,
 		Argv:          argv,
 		Ports:         pidPorts[pid],
-		RSSBytes:      rssKB * 1024,
-		StartIdentity: strings.Join(fields[2:7], " "),
+		StartIdentity: strings.Join(fields[1:6], " "),
 	}, true
 }
 
 func argvFromPSLine(line string) ([]string, bool) {
-	_, command := consumeLeadingFields(line, 7)
+	_, command := consumeLeadingFields(line, 6)
 	if command == "" {
 		return nil, false
 	}

@@ -86,6 +86,15 @@ func SessionNameLocksDir(cityRoot string) string {
 	return RuntimePath(cityRoot, "session-name-locks")
 }
 
+// GateSlotsDir returns the canonical root for the pre-push gate's
+// cross-invocation concurrency slots (ga-owh20p). The bash mechanism in
+// scripts/push-gate-lock-lib.sh owns the actual flock(1) semaphore; this
+// constant exists so Go tooling can locate the same directory without
+// duplicating the ".gc/gate-slots" literal.
+func GateSlotsDir(cityRoot string) string {
+	return RuntimePath(cityRoot, "gate-slots")
+}
+
 // ServiceStateDir returns the canonical runtime directory for a named service.
 func ServiceStateDir(cityRoot, serviceName string) string {
 	if serviceName == "" {
@@ -100,6 +109,14 @@ func PackStateDir(cityRoot, packName string) string {
 		return RuntimePacksDir(cityRoot)
 	}
 	return filepath.Join(RuntimePacksDir(cityRoot), packName)
+}
+
+// SuspensionStateFile returns the path to the unified runtime
+// suspension-state file. It holds the live city, rig, and (in a
+// follow-up) agent suspension preferences that should not be
+// committed to city.toml — each clone gets its own copy.
+func SuspensionStateFile(cityRoot string) string {
+	return RuntimePath(cityRoot, "runtime", "suspension-state.json")
 }
 
 // CityRuntimeEnv returns city runtime env vars rooted at the canonical runtime

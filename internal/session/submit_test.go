@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
@@ -117,6 +120,41 @@ func TestWaitsForIdleAfterInterrupt_WrappedClaude(t *testing.T) {
 	}
 }
 
+// TestProviderFamilyFromInfoMatchesMetadata is the byte-identical oracle for the
+// ProviderFamilyFromInfo twin: for every representative provider-vocab shape, the
+// Info form (fed infoFromPersistedBead(b)) must agree with the metadata form on
+// the builtin_ancestor → provider_kind → provider precedence ladder. It is
+// self-sufficient (asserts the concrete family output, not only Info==metadata),
+// so mutating any precedence rung on either projection is caught here.
+func TestProviderFamilyFromInfoMatchesMetadata(t *testing.T) {
+	cases := []struct {
+		name     string
+		meta     map[string]string
+		fallback string
+		want     string
+	}{
+		{"empty-fallback-codex", map[string]string{}, "codex", "codex"},
+		{"provider-only", map[string]string{"provider": "codex"}, "", "codex"},
+		{"provider-kind-wins-over-provider", map[string]string{"provider": "claude", "provider_kind": "codex"}, "", "codex"},
+		{"builtin-ancestor-wins", map[string]string{"provider": "claude", "provider_kind": "gemini", "builtin_ancestor": "codex"}, "", "codex"},
+		{"wrapped-alias-provider", map[string]string{"provider": "my-pi"}, "", "pi"},
+		{"blank-rungs-fall-through", map[string]string{"builtin_ancestor": "   ", "provider_kind": "", "provider": "codex"}, "", "codex"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := beads.Bead{ID: "s", Type: BeadType, Status: "open", Labels: []string{LabelSession}, Metadata: tc.meta}
+			fromMeta := ProviderFamilyFromMetadata(tc.meta, tc.fallback)
+			fromInfo := ProviderFamilyFromInfo(infoFromPersistedBead(b), tc.fallback)
+			if fromInfo != fromMeta {
+				t.Errorf("ProviderFamilyFromInfo = %q, ProviderFamilyFromMetadata = %q (want equal)", fromInfo, fromMeta)
+			}
+			if fromInfo != tc.want {
+				t.Errorf("ProviderFamilyFromInfo = %q, want %q", fromInfo, tc.want)
+			}
+		})
+	}
+}
+
 func TestInterruptStrategyUsesPiProviderFamilyAlias(t *testing.T) {
 	wrappedPi := beads.Bead{Metadata: map[string]string{
 		"provider": "my-pi/tmux",
@@ -132,9 +170,9 @@ func TestInterruptStrategyUsesPiProviderFamilyAlias(t *testing.T) {
 func TestSubmitDefaultResumesSuspendedClaudeSessionAndWaitsForIdleNudge(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "claude", t.TempDir(), "claude", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -167,9 +205,9 @@ func TestSubmitDefaultResumesSuspendedClaudeSessionAndWaitsForIdleNudge(t *testi
 func TestSubmitDefaultResumesSuspendedCodexSessionAndNudgesImmediately(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -199,9 +237,9 @@ func TestSubmitDefaultResumesSuspendedCodexSessionAndNudgesImmediately(t *testin
 func TestSubmitDefaultCodexDismissesDeferredDialogsOnFirstDelivery(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -235,9 +273,9 @@ func TestSubmitDefaultCodexDismissesDeferredDialogsOnFirstDelivery(t *testing.T)
 func TestSubmitDefaultCodexSkipsDeferredDialogsAfterVerification(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -263,9 +301,9 @@ func TestSubmitDefaultCodexSkipsDeferredDialogsAfterVerification(t *testing.T) {
 func TestSubmitDefaultResumesSuspendedGeminiSessionAndNudgesImmediately(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "gemini", t.TempDir(), "gemini", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "gemini", WorkDir: t.TempDir(), Provider: "gemini", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -301,9 +339,9 @@ func TestSubmitDefaultResumesSuspendedGeminiSessionAndNudgesImmediately(t *testi
 func TestSubmitDefaultToRunningGeminiSessionWaitsForIdleNudge(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "gemini", t.TempDir(), "gemini", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "gemini", WorkDir: t.TempDir(), Provider: "gemini", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -336,7 +374,7 @@ func TestSubmitDefaultToRunningGeminiSessionWaitsForIdleNudge(t *testing.T) {
 func TestSubmitDefaultConfirmsLiveCreatingSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
 	workDir := t.TempDir()
 	sessionName := "s-live-create"
@@ -384,11 +422,14 @@ func TestSubmitFollowUpQueuesDeferredMessageAndStartsCodexPoller(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	cityPath := t.TempDir()
-	mgr := NewManagerWithCityPath(store, sp, cityPath)
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "alias", "helper-alias"); err != nil {
+		t.Fatalf("SetMetadata(alias): %v", err)
 	}
 
 	var pollerCalls int
@@ -426,8 +467,8 @@ func TestSubmitFollowUpQueuesDeferredMessageAndStartsCodexPoller(t *testing.T) {
 	if item.SessionID != info.ID {
 		t.Fatalf("SessionID = %q, want %q", item.SessionID, info.ID)
 	}
-	if item.Agent != info.ID {
-		t.Fatalf("Agent = %q, want %q", item.Agent, info.ID)
+	if item.Agent != "helper-alias" {
+		t.Fatalf("Agent = %q, want helper-alias", item.Agent)
 	}
 	if item.Message != "follow up later" {
 		t.Fatalf("Message = %q, want %q", item.Message, "follow up later")
@@ -454,21 +495,354 @@ func TestEnsureSessionSubmitPollerRejectsGoTestExecutable(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Go test binary") {
 		t.Fatalf("ensureSessionSubmitPoller error = %v, want Go test binary refusal", err)
 	}
-	if _, statErr := os.Stat(sessionSubmitPollerPIDPath(cityPath, "s-test")); !errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(sessionSubmitPollerPIDPath(cityPath, "s-test", "agent")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("poller pid file stat error = %v, want not exist", statErr)
 	}
-	if _, statErr := os.Stat(sessionSubmitPollerLogPath(cityPath, "s-test")); !errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(sessionSubmitPollerLogPath(cityPath, "s-test", "agent")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("poller log file stat error = %v, want not exist", statErr)
 	}
+}
+
+func TestExistingSessionSubmitPollerPIDRejectsUnrelatedLivePID(t *testing.T) {
+	cityPath := t.TempDir()
+	pidPath := sessionSubmitPollerPIDPath(cityPath, "s-test", "session-id")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	running, err := existingSessionSubmitPollerPID(pidPath, cityPath, "s-test", "session-id")
+	if err != nil {
+		t.Fatalf("existingSessionSubmitPollerPID: %v", err)
+	}
+	if running {
+		t.Fatalf("existingSessionSubmitPollerPID(%q) = true for unrelated live PID %d", pidPath, os.Getpid())
+	}
+}
+
+func TestExistingSessionSubmitPollerPIDAcceptsMatchingCitySession(t *testing.T) {
+	cityPath := filepath.Join(t.TempDir(), "city with spaces")
+	sessionName := "s-test"
+	pidPath := sessionSubmitPollerPIDPath(cityPath, sessionName, "session-id")
+	cmd := startSubmitPollerLikeProcess(t, cityPath, sessionName, "session-id")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	running, err := existingSessionSubmitPollerPID(pidPath, cityPath, sessionName, "session-id")
+	if err != nil {
+		t.Fatalf("existingSessionSubmitPollerPID: %v", err)
+	}
+	if !running {
+		t.Fatalf("existingSessionSubmitPollerPID(%q) = false for matching poller PID %d", pidPath, cmd.Process.Pid)
+	}
+}
+
+func TestExistingSessionSubmitPollerPIDRejectsDifferentCitySameSession(t *testing.T) {
+	cityPath := t.TempDir()
+	otherCityPath := t.TempDir()
+	sessionName := "s-test"
+	pidPath := sessionSubmitPollerPIDPath(cityPath, sessionName, "session-id")
+	cmd := startSubmitPollerLikeProcess(t, otherCityPath, sessionName, "session-id")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	running, err := existingSessionSubmitPollerPID(pidPath, cityPath, sessionName, "session-id")
+	if err != nil {
+		t.Fatalf("existingSessionSubmitPollerPID: %v", err)
+	}
+	if running {
+		t.Fatalf("existingSessionSubmitPollerPID(%q) = true for same-session poller in different city", pidPath)
+	}
+}
+
+func TestExistingSessionSubmitPollerPIDRejectsDifferentTargetSameCitySession(t *testing.T) {
+	cityPath := t.TempDir()
+	sessionName := "s-test"
+	pidPath := sessionSubmitPollerPIDPath(cityPath, sessionName, "session-id")
+	cmd := startSubmitPollerLikeProcess(t, cityPath, sessionName, "old-alias")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	running, err := existingSessionSubmitPollerPID(pidPath, cityPath, sessionName, "session-id")
+	if err != nil {
+		t.Fatalf("existingSessionSubmitPollerPID: %v", err)
+	}
+	if running {
+		t.Fatalf("existingSessionSubmitPollerPID(%q) = true for same-session poller with different target key", pidPath)
+	}
+}
+
+func TestSessionSubmitPollerPathsScopeSameSessionByTarget(t *testing.T) {
+	cityPath := t.TempDir()
+	sessionName := "s-test"
+	pidPathA := sessionSubmitPollerPIDPath(cityPath, sessionName, "session-a")
+	pidPathB := sessionSubmitPollerPIDPath(cityPath, sessionName, "session-b")
+	logPathA := sessionSubmitPollerLogPath(cityPath, sessionName, "session-a")
+	logPathB := sessionSubmitPollerLogPath(cityPath, sessionName, "session-b")
+	if pidPathA == pidPathB {
+		t.Fatalf("sessionSubmitPollerPIDPath returned the same path for distinct targets: %q", pidPathA)
+	}
+	if logPathA == logPathB {
+		t.Fatalf("sessionSubmitPollerLogPath returned the same path for distinct targets: %q", logPathA)
+	}
+}
+
+func TestDeferredSubmitPollerKeyFallbackOrder(t *testing.T) {
+	cases := []struct {
+		name string
+		bead beads.Bead
+		want string
+	}{
+		{
+			name: "session id wins over alias",
+			bead: beads.Bead{
+				ID:       "session-id",
+				Metadata: map[string]string{"alias": "alias", "template": "template", "session_name": "s-test"},
+				Title:    "title",
+			},
+			want: "session-id",
+		},
+		{
+			name: "alias fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{"alias": "alias", "template": "template", "session_name": "s-test"},
+				Title:    "title",
+			},
+			want: "alias",
+		},
+		{
+			name: "template fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{"template": "template", "session_name": "s-test"},
+				Title:    "title",
+			},
+			want: "template",
+		},
+		{
+			name: "agent name fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{"agent_name": "agent", "template": "template", "session_name": "s-test"},
+				Title:    "title",
+			},
+			want: "agent",
+		},
+		{
+			name: "session name fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{"session_name": "s-test"},
+				Title:    "title",
+			},
+			want: "s-test",
+		},
+		{
+			name: "title fallback",
+			bead: beads.Bead{Title: "title"},
+			want: "title",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deferredSubmitPollerKey(tc.bead); got != tc.want {
+				t.Fatalf("deferredSubmitPollerKey() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPollerKeyFromBeadFallbackOrder(t *testing.T) {
+	cases := []struct {
+		name string
+		bead beads.Bead
+		want string
+	}{
+		{
+			name: "session id wins over metadata",
+			bead: beads.Bead{
+				ID: "session-id",
+				Metadata: map[string]string{
+					"alias":        "alias",
+					"agent_name":   "agent",
+					"template":     "template",
+					"session_name": "s-test",
+				},
+				Title: "title",
+			},
+			want: "session-id",
+		},
+		{
+			name: "alias fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{
+					"alias":        "alias",
+					"agent_name":   "agent",
+					"template":     "template",
+					"session_name": "s-test",
+				},
+				Title: "title",
+			},
+			want: "alias",
+		},
+		{
+			name: "agent name fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{
+					"agent_name":   "agent",
+					"template":     "template",
+					"session_name": "s-test",
+				},
+				Title: "title",
+			},
+			want: "agent",
+		},
+		{
+			name: "template fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{
+					"template":     "template",
+					"session_name": "s-test",
+				},
+				Title: "title",
+			},
+			want: "template",
+		},
+		{
+			name: "session name fallback",
+			bead: beads.Bead{
+				Metadata: map[string]string{"session_name": "s-test"},
+				Title:    "title",
+			},
+			want: "s-test",
+		},
+		{
+			name: "title fallback",
+			bead: beads.Bead{Title: "title"},
+			want: "title",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PollerKeyFromBead(tc.bead); got != tc.want {
+				t.Fatalf("PollerKeyFromBead() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPollerKeyFromInfoMatchesBead pins PollerKeyFromInfo against its raw twin:
+// for each fixture it asserts the exact key (self-sufficient — a mutated
+// fallback order or a wrong field fails directly) AND that the Info projection of
+// the same bead yields the identical key, so the two forms cannot drift. The
+// session-name fixture specifically guards that PollerKeyFromInfo reads the RAW
+// SessionNameMetadata (not the sessionNameFor-filled SessionName).
+func TestPollerKeyFromInfoMatchesBead(t *testing.T) {
+	cases := []struct {
+		name string
+		bead beads.Bead
+		want string
+	}{
+		{
+			name: "session id wins over metadata",
+			bead: beads.Bead{ID: "session-id", Metadata: map[string]string{"alias": "alias", "session_name": "s-test"}, Title: "title"},
+			want: "session-id",
+		},
+		{
+			name: "alias fallback",
+			bead: beads.Bead{Metadata: map[string]string{"alias": "alias", "agent_name": "agent", "template": "template", "session_name": "s-test"}, Title: "title"},
+			want: "alias",
+		},
+		{
+			name: "agent name fallback",
+			bead: beads.Bead{Metadata: map[string]string{"agent_name": "agent", "template": "template", "session_name": "s-test"}, Title: "title"},
+			want: "agent",
+		},
+		{
+			name: "template fallback",
+			bead: beads.Bead{Metadata: map[string]string{"template": "template", "session_name": "s-test"}, Title: "title"},
+			want: "template",
+		},
+		{
+			name: "raw session_name fallback",
+			bead: beads.Bead{Metadata: map[string]string{"session_name": "s-test"}, Title: "title"},
+			want: "s-test",
+		},
+		{
+			name: "title fallback",
+			bead: beads.Bead{Title: "title"},
+			want: "title",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := infoFromPersistedBead(tc.bead)
+			got := PollerKeyFromInfo(info)
+			if got != tc.want {
+				t.Fatalf("PollerKeyFromInfo() = %q, want %q", got, tc.want)
+			}
+			if raw := PollerKeyFromBead(tc.bead); got != raw {
+				t.Fatalf("PollerKeyFromInfo() = %q diverged from PollerKeyFromBead() = %q", got, raw)
+			}
+		})
+	}
+}
+
+func startSubmitPollerLikeProcess(t *testing.T, cityPath, sessionName, agentName string) *exec.Cmd {
+	t.Helper()
+	scriptPath := filepath.Join(t.TempDir(), "gc-fake")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nread _hold\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake poller): %v", err)
+	}
+	cmd := exec.Command(scriptPath, nudgepoller.CommandArgs(cityPath, sessionName, agentName)...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe(fake poller): %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		t.Fatalf("Start(fake poller): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = stdin.Close()
+		_ = cmd.Wait()
+	})
+	waitForSubmitPollerCmdline(t, cmd.Process.Pid, cityPath, sessionName, agentName)
+	return cmd
+}
+
+func waitForSubmitPollerCmdline(t *testing.T, pid int, cityPath, sessionName, agentName string) {
+	t.Helper()
+	matches := nudgepoller.CmdlineMatcher(cityPath, sessionName, agentName)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pidutil.AliveWithCmdline(pid, matches) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("poller PID %d did not expose matching command line", pid)
 }
 
 func TestSubmitFollowUpQueuesDeferredMessageForPoolManagedSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	cityPath := t.TempDir()
-	mgr := NewManagerWithCityPath(store, sp, cityPath)
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -501,9 +875,9 @@ func TestSubmitFollowUpOnSuspendedSessionFallsBackToImmediateSend(t *testing.T) 
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	cityPath := t.TempDir()
-	mgr := NewManagerWithCityPath(store, sp, cityPath)
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
 
-	info, err := mgr.Create(context.Background(), "helper", "", "claude", t.TempDir(), "claude", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -544,9 +918,9 @@ func TestSubmitFollowUpOnAsleepSessionFallsBackToImmediateSend(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	cityPath := t.TempDir()
-	mgr := NewManagerWithCityPath(store, sp, cityPath)
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
 
-	info, err := mgr.Create(context.Background(), "helper", "", "claude", t.TempDir(), "claude", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -590,9 +964,9 @@ func TestSubmitDefaultQueuesWhenWakeAlreadyRequested(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	cityPath := t.TempDir()
-	mgr := NewManagerWithCityPath(store, sp, cityPath)
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
 
-	info, err := mgr.Create(context.Background(), "helper", "", "claude", t.TempDir(), "claude", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -667,12 +1041,66 @@ func TestSubmissionCapabilitiesRemainEnabledForPoolManagedSessions(t *testing.T)
 	}
 }
 
+func TestSubmissionCapabilitiesDisableInterruptNowForAntigravity(t *testing.T) {
+	caps := SubmissionCapabilitiesForMetadata(
+		map[string]string{
+			"provider_kind": "antigravity",
+			"provider":      "antigravity",
+		},
+		true,
+	)
+	if !caps.SupportsFollowUp {
+		t.Fatal("SupportsFollowUp = false, want true")
+	}
+	if caps.SupportsInterruptNow {
+		t.Fatal("SupportsInterruptNow = true, want false for Antigravity")
+	}
+}
+
+func TestSubmissionCapabilitiesDisableInterruptNowForWrappedAntigravity(t *testing.T) {
+	caps := SubmissionCapabilitiesForMetadata(
+		map[string]string{
+			"builtin_ancestor": "antigravity",
+			"provider":         "custom-antigravity",
+		},
+		true,
+	)
+	if caps.SupportsInterruptNow {
+		t.Fatal("SupportsInterruptNow = true, want false for wrapped Antigravity")
+	}
+}
+
+func TestSubmitInterruptNowRejectsAntigravitySession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "antigravity", WorkDir: t.TempDir(), Provider: "antigravity", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	callsBefore := len(sp.Calls)
+
+	outcome, err := mgr.Submit(context.Background(), info.ID, "take this now", BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir}, SubmitIntentInterruptNow)
+	if !errors.Is(err, ErrInteractionUnsupported) {
+		t.Fatalf("Submit(interrupt_now) error = %v, want ErrInteractionUnsupported", err)
+	}
+	if outcome.Queued {
+		t.Fatal("Submit(interrupt_now) unexpectedly queued")
+	}
+	for _, call := range sp.Calls[callsBefore:] {
+		if call.Method == "Interrupt" || call.Method == "NudgeNow" || call.Method == "SendKeys" || call.Method == "Stop" {
+			t.Fatalf("unexpected runtime call after unsupported interrupt_now: %#v", call)
+		}
+	}
+}
+
 func TestSubmitInterruptNowUsesInterruptAndIdleWaitForGemini(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "gemini", t.TempDir(), "gemini", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "gemini", WorkDir: t.TempDir(), Provider: "gemini", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -739,9 +1167,9 @@ func TestSubmitInterruptNowUsesInterruptAndIdleWaitForGemini(t *testing.T) {
 func TestSubmitInterruptNowAllowsPoolManagedCodexSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -800,9 +1228,9 @@ func TestSubmitInterruptNowAllowsPoolManagedCodexSession(t *testing.T) {
 func TestSubmitInterruptNowUsesInterruptAndIdleWaitForClaude(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "claude", t.TempDir(), "claude", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -852,9 +1280,9 @@ func TestSubmitInterruptNowFallsBackToRestartOnIdleTimeout(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	sp.WaitForIdleErrors = map[string]error{}
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "claude", t.TempDir(), "claude", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -888,9 +1316,9 @@ func TestSubmitInterruptNowFallsBackToRestartOnIdleTimeout(t *testing.T) {
 func TestSubmitInterruptNowUsesControlCFallbackAfterSoftEscapeTimeoutForCodex(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -937,9 +1365,9 @@ func TestSubmitInterruptNowUsesControlCFallbackAfterSoftEscapeTimeoutForCodex(t 
 func TestSubmitInterruptNowFallsBackToRestartOnInterruptBoundaryTimeoutForCodex(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -973,9 +1401,9 @@ func TestSubmitInterruptNowFallsBackToRestartOnInterruptBoundaryTimeoutForCodex(
 func TestSubmitInterruptNowHardRestartsAndTruncatesPiPendingTurn(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "pi --session abc123", t.TempDir(), "pi", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "pi --session abc123", WorkDir: t.TempDir(), Provider: "pi", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1077,9 +1505,9 @@ func TestSubmitInterruptNowHardRestartsAndTruncatesPiPendingTurn(t *testing.T) {
 func TestSubmitInterruptNowRestoresPiSessionWhenTranscriptResetFails(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "pi --session abc123", t.TempDir(), "pi", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "pi --session abc123", WorkDir: t.TempDir(), Provider: "pi", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1151,9 +1579,9 @@ func TestSubmitInterruptNowRestoresPiSessionWhenTranscriptResetFails(t *testing.
 func TestSubmitInterruptNowTruncatesPiTranscriptBySessionKey(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp, WithStaleKeyDetectionWaiter(immediateStaleKeyDetectionWaiter))
 
-	info, err := mgr.Create(context.Background(), "helper", "", "pi --session target", t.TempDir(), "pi", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "pi --session target", WorkDir: t.TempDir(), Provider: "pi", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1222,9 +1650,9 @@ func TestSubmitInterruptNowTruncatesPiTranscriptBySessionKey(t *testing.T) {
 func TestSubmitInterruptNowFailsClosedOnPiSessionKeyMismatch(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "pi --session target", t.TempDir(), "pi", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "pi --session target", WorkDir: t.TempDir(), Provider: "pi", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1269,9 +1697,9 @@ func TestSubmitInterruptNowFailsClosedOnPiSessionKeyMismatch(t *testing.T) {
 func TestSubmitInterruptNowFailsClosedOnAmbiguousPiTranscript(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "pi", t.TempDir(), "pi", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "pi", WorkDir: t.TempDir(), Provider: "pi", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1326,9 +1754,9 @@ func TestSubmitInterruptNowFailsClosedOnAmbiguousPiTranscript(t *testing.T) {
 func TestSubmitInterruptNowPiContinuesWhenSessionFileMissing(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "pi --session missing", t.TempDir(), "pi", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "pi --session missing", WorkDir: t.TempDir(), Provider: "pi", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1367,12 +1795,13 @@ func TestSubmitInterruptNowPiContinuesWhenSessionFileMissing(t *testing.T) {
 func TestSubmitInterruptNowFindsPiDefaultSessionPath(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 
-	info, err := mgr.Create(context.Background(), "helper", "", "pi --session abc123", t.TempDir(), "pi", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "pi --session abc123", WorkDir: t.TempDir(), Provider: "pi", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1403,9 +1832,9 @@ func TestSubmitInterruptNowFindsPiDefaultSessionPath(t *testing.T) {
 func TestStopTurnUsesSoftEscapeAndIdleWaitForCodex(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1440,9 +1869,9 @@ func TestStopTurnUsesSoftEscapeAndIdleWaitForCodex(t *testing.T) {
 func TestStopTurnUsesControlCFallbackAfterSoftEscapeTimeoutForCodex(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	mgr := NewManager(store, sp)
+	mgr := NewManagerWithOptions(store, sp)
 
-	info, err := mgr.Create(context.Background(), "helper", "", "codex", t.TempDir(), "codex", nil, ProviderResume{}, runtime.Config{})
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1487,4 +1916,97 @@ func containsSubsequence(have, want []string) bool {
 		}
 	}
 	return false
+}
+
+// TestSubmitDefaultDeferredResetPendingStampsEmptyEpochToSurviveRotation proves
+// a submit deferred while a conversation reset is pending is fenced by session
+// alone, not by the current epoch. commitPendingContinuationReset rotates
+// continuation_epoch N->N+1 when the replacement incarnation starts, so a
+// fixed epoch-N stamp would be rejected by the queued-nudge fence and
+// dead-lettered — silently dropping the message. An empty epoch survives the
+// rotation.
+func TestSubmitDefaultDeferredResetPendingStampsEmptyEpochToSurviveRotation(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	cityPath := t.TempDir()
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := sp.Stop(info.SessionName); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := store.SetMetadataBatch(info.ID, map[string]string{
+		"continuation_epoch":         "1",
+		"continuation_reset_pending": "true",
+	}); err != nil {
+		t.Fatalf("SetMetadataBatch: %v", err)
+	}
+
+	outcome, err := mgr.Submit(context.Background(), info.ID, "deliver after reset", BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir}, SubmitIntentDefault)
+	if err != nil {
+		t.Fatalf("Submit(default): %v", err)
+	}
+	if !outcome.Queued {
+		t.Fatal("Submit(default) should queue while a conversation reset is pending")
+	}
+	state, err := nudgequeue.LoadState(cityPath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 {
+		t.Fatalf("pending queued submits = %d, want 1", len(state.Pending))
+	}
+	item := state.Pending[0]
+	if item.SessionID != info.ID {
+		t.Fatalf("SessionID = %q, want %q", item.SessionID, info.ID)
+	}
+	if item.ContinuationEpoch != "" {
+		t.Fatalf("ContinuationEpoch = %q, want empty so the deferred submit survives the N->N+1 reset rotation", item.ContinuationEpoch)
+	}
+}
+
+// TestSubmitDefaultDeferredRestartRequestedKeepsCurrentEpoch guards the fix's
+// scope: a plain restart (restart_requested, no reset) does NOT rotate the
+// epoch, so those defers keep their current-epoch stamp and stay fenced to the
+// resumed conversation.
+func TestSubmitDefaultDeferredRestartRequestedKeepsCurrentEpoch(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	cityPath := t.TempDir()
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := sp.Stop(info.SessionName); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := store.SetMetadataBatch(info.ID, map[string]string{
+		"continuation_epoch": "4",
+		"restart_requested":  "true",
+	}); err != nil {
+		t.Fatalf("SetMetadataBatch: %v", err)
+	}
+
+	outcome, err := mgr.Submit(context.Background(), info.ID, "deliver after restart", BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir}, SubmitIntentDefault)
+	if err != nil {
+		t.Fatalf("Submit(default): %v", err)
+	}
+	if !outcome.Queued {
+		t.Fatal("Submit(default) should queue while a restart is pending")
+	}
+	state, err := nudgequeue.LoadState(cityPath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 {
+		t.Fatalf("pending queued submits = %d, want 1", len(state.Pending))
+	}
+	if got := state.Pending[0].ContinuationEpoch; got != "4" {
+		t.Fatalf("ContinuationEpoch = %q, want 4 (plain restart keeps the current epoch)", got)
+	}
 }

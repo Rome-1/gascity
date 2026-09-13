@@ -731,3 +731,136 @@ func writeOrderDiscoveryFile(t *testing.T, dir, name, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestScanAllCityScopedOrderRegistersOnceAcrossRigs(t *testing.T) {
+	cityPath, cityLayer := orderDiscoveryCity(t)
+	packDir := filepath.Join(t.TempDir(), "mixed-pack")
+	// A scope=city order must register exactly once no matter how many rigs
+	// import the pack.
+	writeOrderDiscoveryFile(t, filepath.Join(packDir, "orders"), "city-sweep", `[order]
+scope = "city"
+exec = "scripts/sweep.sh"
+trigger = "cooldown"
+interval = "5m"
+`)
+	// An unscoped (rig-default) order still registers once per importing rig.
+	writeOrderDiscoveryFile(t, filepath.Join(packDir, "orders"), "rig-health", `[order]
+exec = "scripts/health.sh"
+trigger = "cooldown"
+interval = "5m"
+`)
+
+	cfg := &config.City{
+		FormulaLayers: config.FormulaLayers{
+			City: []string{cityLayer},
+			Rigs: map[string][]string{
+				"alpha": {cityLayer},
+				"beta":  {cityLayer},
+			},
+		},
+		RigPackDirs: map[string][]string{
+			"alpha": {packDir},
+			"beta":  {packDir},
+		},
+	}
+
+	aa, err := ScanAll(cityPath, cfg, ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanAll returned error: %v", err)
+	}
+
+	citySweepCount := 0
+	citySweepRig := "<unset>"
+	rigHealth := map[string]int{}
+	for _, a := range aa {
+		switch a.Name {
+		case "city-sweep":
+			citySweepCount++
+			citySweepRig = a.Rig
+		case "rig-health":
+			rigHealth[a.Rig]++
+		}
+	}
+	if citySweepCount != 1 {
+		t.Fatalf("city-scoped order registered %d times, want 1: %#v", citySweepCount, aa)
+	}
+	if citySweepRig != "" {
+		t.Fatalf("city-scoped order Rig = %q, want \"\" (city-scoped)", citySweepRig)
+	}
+	if rigHealth["alpha"] != 1 || rigHealth["beta"] != 1 {
+		t.Fatalf("rig-scoped order counts = %v, want one per importing rig", rigHealth)
+	}
+}
+
+// The city-default [workspace] timezone is stamped onto orders that don't
+// author their own tz, and never overrides an authored tz. This is how cron
+// evaluation gets one explicit location without widening CheckTrigger.
+func TestScanAllStampsWorkspaceTimezoneOntoOrdersWithoutTZ(t *testing.T) {
+	cityPath, _ := orderDiscoveryCity(t)
+	writeOrderDiscoveryFile(t, filepath.Join(cityPath, "orders"), "inherits-tz", `[order]
+exec = "scripts/digest.sh"
+trigger = "cron"
+schedule = "30 19 * * *"
+`)
+	writeOrderDiscoveryFile(t, filepath.Join(cityPath, "orders"), "owns-tz", `[order]
+exec = "scripts/digest.sh"
+trigger = "cron"
+schedule = "30 19 * * *"
+tz = "Europe/Berlin"
+`)
+
+	cfg := &config.City{Workspace: config.Workspace{Timezone: "America/New_York"}}
+	aa, err := ScanAll(cityPath, cfg, ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanAll returned error: %v", err)
+	}
+	got := make(map[string]string, len(aa))
+	for _, a := range aa {
+		got[a.Name] = a.TZ
+	}
+	if got["inherits-tz"] != "America/New_York" {
+		t.Errorf("inherits-tz TZ = %q, want workspace default %q", got["inherits-tz"], "America/New_York")
+	}
+	if got["owns-tz"] != "Europe/Berlin" {
+		t.Errorf("owns-tz TZ = %q, want authored %q kept over the workspace default", got["owns-tz"], "Europe/Berlin")
+	}
+}
+
+// A bad [workspace] timezone fails order discovery loudly instead of
+// silently moving every inheriting order onto a different wall clock.
+func TestScanAllBadWorkspaceTimezoneFailsLoudly(t *testing.T) {
+	cityPath, _ := orderDiscoveryCity(t)
+	writeOrderDiscoveryFile(t, filepath.Join(cityPath, "orders"), "digest", `[order]
+exec = "scripts/digest.sh"
+trigger = "cron"
+schedule = "30 19 * * *"
+`)
+
+	cfg := &config.City{Workspace: config.Workspace{Timezone: "America/New_Yrok"}}
+	_, err := ScanAll(cityPath, cfg, ScanOptions{})
+	if err == nil {
+		t.Fatal("ScanAll should fail: bad [workspace] timezone")
+	}
+	if !strings.Contains(err.Error(), `timezone "America/New_Yrok"`) {
+		t.Errorf("error = %q, want it to name the invalid timezone", err)
+	}
+}
+
+// A bad order-authored tz fails validation during discovery (no handler).
+func TestScanAllBadOrderTZFailsValidation(t *testing.T) {
+	cityPath, _ := orderDiscoveryCity(t)
+	writeOrderDiscoveryFile(t, filepath.Join(cityPath, "orders"), "digest", `[order]
+exec = "scripts/digest.sh"
+trigger = "cron"
+schedule = "30 19 * * *"
+tz = "Amrica/New_York"
+`)
+
+	_, err := ScanAll(cityPath, &config.City{}, ScanOptions{})
+	if err == nil {
+		t.Fatal("ScanAll should fail: bad order tz")
+	}
+	if !strings.Contains(err.Error(), `invalid tz "Amrica/New_York"`) {
+		t.Errorf("error = %q, want it to name the invalid tz", err)
+	}
+}

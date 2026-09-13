@@ -42,14 +42,48 @@ mode = "on_demand"
 	if err != nil {
 		t.Fatalf("LoadWithIncludes: %v", err)
 	}
-	if len(cfg.NamedSessions) != 2 {
-		t.Fatalf("len(NamedSessions) = %d, want 2", len(cfg.NamedSessions))
+	sessions := userNamedSessions(cfg.NamedSessions)
+	if len(sessions) != 2 {
+		t.Fatalf("len(user NamedSessions) = %d, want 2", len(sessions))
 	}
-	if cfg.NamedSessions[0].Template != "mayor" {
-		t.Errorf("NamedSessions[0].Template = %q, want %q", cfg.NamedSessions[0].Template, "mayor")
+	if sessions[0].Template != "mayor" {
+		t.Errorf("NamedSessions[0].Template = %q, want %q", sessions[0].Template, "mayor")
 	}
-	if cfg.NamedSessions[1].Template != "polecat" {
-		t.Errorf("NamedSessions[1].Template = %q, want %q", cfg.NamedSessions[1].Template, "polecat")
+	if sessions[1].Template != "polecat" {
+		t.Errorf("NamedSessions[1].Template = %q, want %q", sessions[1].Template, "polecat")
+	}
+}
+
+func TestLoadWithIncludes_AppendExtMsgDefaultRoutes(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+include = ["extra.toml"]
+
+[workspace]
+name = "test"
+
+[[extmsg.default_route]]
+provider = "telegram"
+agent = "myrig/frontdesk"
+`)
+	fs.Files["/city/extra.toml"] = []byte(`
+[[extmsg.default_route]]
+provider = "telegram"
+account_id = "ops"
+agent = "myrig/operator"
+`)
+	cfg, _, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	if len(cfg.ExtMsg.DefaultRoutes) != 2 {
+		t.Fatalf("len(DefaultRoutes) = %d, want 2", len(cfg.ExtMsg.DefaultRoutes))
+	}
+	if got := cfg.ExtMsgDefaultRouteAgent("telegram", "ops"); got != "myrig/operator" {
+		t.Fatalf("ExtMsgDefaultRouteAgent(telegram, ops) = %q, want myrig/operator", got)
+	}
+	if got := cfg.ExtMsgDefaultRouteAgent("telegram", "default"); got != "myrig/frontdesk" {
+		t.Fatalf("ExtMsgDefaultRouteAgent(telegram, default) = %q, want myrig/frontdesk", got)
 	}
 }
 
@@ -357,6 +391,9 @@ name = "full-pipeline-city"
 provider = "claude"
 includes = ["packs/mypk"]
 
+[providers.claude]
+base = "builtin:claude"
+
 [[agent]]
 name = "mayor"
 scope = "city"
@@ -417,11 +454,12 @@ formula = "demo"
 	}
 
 	// 1. Fragment merged: named session should be present.
-	if len(cfg.NamedSessions) != 1 {
-		t.Fatalf("len(NamedSessions) = %d, want 1", len(cfg.NamedSessions))
+	sessions := userNamedSessions(cfg.NamedSessions)
+	if len(sessions) != 1 {
+		t.Fatalf("len(user NamedSessions) = %d, want 1", len(sessions))
 	}
-	if cfg.NamedSessions[0].Template != "mayor" {
-		t.Errorf("NamedSession template = %q, want %q", cfg.NamedSessions[0].Template, "mayor")
+	if sessions[0].Template != "mayor" {
+		t.Errorf("NamedSession template = %q, want %q", sessions[0].Template, "mayor")
 	}
 
 	// 2. City pack expanded: pack-city-agent should be present.
@@ -740,6 +778,9 @@ func TestLoadWithIncludes_AgentDefaultsFlowThrough(t *testing.T) {
 [workspace]
 name = "test"
 provider = "claude"
+
+[providers.claude]
+base = "builtin:claude"
 
 [[agent]]
 name = "worker"

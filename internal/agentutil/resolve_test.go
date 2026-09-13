@@ -212,6 +212,47 @@ func TestResolveAgentNotFound(t *testing.T) {
 	}
 }
 
+func TestRoutedToIdentity(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent *config.Agent
+		want  string
+	}{
+		{
+			name:  "pool instance collapses to PoolName",
+			agent: &config.Agent{Name: "polecat-2", Dir: "myrig", PoolName: "myrig/polecat"},
+			want:  "myrig/polecat",
+		},
+		{
+			name:  "bound agent with no PoolName uses QualifiedName",
+			agent: &config.Agent{Name: "dog", BindingName: "gastown"},
+			want:  "gastown.dog",
+		},
+		{
+			name:  "doubled qualified name is unaffected when PoolName unset",
+			agent: &config.Agent{Name: "dog", BindingName: "dog"},
+			want:  "dog.dog",
+		},
+		{
+			name:  "unbound agent uses bare QualifiedName",
+			agent: &config.Agent{Name: "mayor"},
+			want:  "mayor",
+		},
+		{
+			name:  "nil agent returns empty string",
+			agent: nil,
+			want:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RoutedToIdentity(tt.agent); got != tt.want {
+				t.Errorf("RoutedToIdentity(%+v) = %q, want %q", tt.agent, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNormalizePoolRouteTarget(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{
@@ -247,8 +288,70 @@ func TestNormalizePoolRouteTarget(t *testing.T) {
 	}
 }
 
+// A configured agent whose name happens to end in "-<digits>" must keep its
+// identity even when a same-prefixed unbounded pool exists: the literal agent
+// wins, mirroring ResolveAgent's literal-before-pool-instance precedence.
+func TestNormalizePoolRouteTargetConfiguredAgentWins(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			// Unbounded pool: any numeric suffix would otherwise collapse.
+			{Name: "polecat", Dir: "myrig", MaxActiveSessions: intPtr(-1)},
+			// A distinct configured agent that merely looks slot-suffixed.
+			{Name: "polecat-4090", Dir: "myrig"},
+		},
+	}
+	if got := NormalizePoolRouteTarget(cfg, "myrig/polecat-4090"); got != "myrig/polecat-4090" {
+		t.Errorf("configured agent collapsed: got %q, want %q", got, "myrig/polecat-4090")
+	}
+	// A genuine slot suffix (no agent of that name) still collapses.
+	if got := NormalizePoolRouteTarget(cfg, "myrig/polecat-3"); got != "myrig/polecat" {
+		t.Errorf("slot suffix did not collapse: got %q, want %q", got, "myrig/polecat")
+	}
+}
+
 func TestNormalizePoolRouteTargetNilConfig(t *testing.T) {
 	if got := NormalizePoolRouteTarget(nil, "myrig/polecat-2"); got != "myrig/polecat-2" {
 		t.Errorf("NormalizePoolRouteTarget(nil) = %q, want unchanged", got)
+	}
+}
+
+func TestAgentReachesWorkflowStoreCityScopedReachesAnyStore(t *testing.T) {
+	// vp-kvp stage i: the cross-store route guard
+	// (validateBuiltInRouteStoreReachable) must NOT refuse a route to a
+	// city-scoped (cross-store-eligible) target — it legitimately serves any
+	// store. Before this exemption, AgentReachesWorkflowStore gated city-scoped
+	// agents (no Dir) to "city:" stores only, so routing rig-store work to the
+	// city singleton failed loud as a false positive, blocking stages ii/iii.
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "voxist-web", Path: "/c/voxist-web", Prefix: "vw"}},
+	}
+	cityAgent := &config.Agent{Name: "platform-architect", Scope: "city"}
+
+	if !AgentReachesWorkflowStore("rig:voxist-web", cityAgent, "/c", cfg) {
+		t.Fatal("city-scoped agent must reach a rig store (cross-store eligible)")
+	}
+	if !AgentReachesWorkflowStore("city:test-city", cityAgent, "/c", cfg) {
+		t.Fatal("city-scoped agent must still reach the city store")
+	}
+
+	// Rig-scoped agents are byte-for-byte unchanged: still single-store.
+	rigAgent := &config.Agent{Name: "reviewer", Dir: "voxist-web"}
+	if AgentReachesWorkflowStore("city:test-city", rigAgent, "/c", cfg) {
+		t.Fatal("rig-scoped agent must not reach the city store")
+	}
+	if !AgentReachesWorkflowStore("rig:voxist-web", rigAgent, "/c", cfg) {
+		t.Fatal("rig-scoped agent must reach its own rig store")
+	}
+}
+
+func TestAgentIsCrossStoreEligible(t *testing.T) {
+	if !AgentIsCrossStoreEligible(&config.Agent{Scope: "city"}) {
+		t.Fatal("scope=city must be cross-store eligible")
+	}
+	if AgentIsCrossStoreEligible(&config.Agent{Dir: "voxist-web"}) {
+		t.Fatal("rig-scoped agent must not be cross-store eligible")
+	}
+	if AgentIsCrossStoreEligible(nil) {
+		t.Fatal("nil agent must not be cross-store eligible")
 	}
 }
