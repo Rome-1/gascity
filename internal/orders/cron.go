@@ -39,21 +39,25 @@ func cronFieldValuesAt(t time.Time) [CronFieldCount]int {
 // wall-clock reading. It returns an error when any field is unparseable rather
 // than treating it as a non-match: a schedule nobody can parse is a broken
 // order, not an order that is merely not due.
+//
+// Every field is parsed even after an earlier one misses, so a malformed field
+// fails loudly instead of hiding behind an earlier non-match.
 func CronScheduleMatchesAt(fields []string, t time.Time) (bool, error) {
 	if len(fields) != CronFieldCount {
 		return false, fmt.Errorf("want %d fields, got %d", CronFieldCount, len(fields))
 	}
 	values := cronFieldValuesAt(t)
+	allMatched := true
 	for i, spec := range cronFieldSpecs {
 		matched, err := CronFieldMatches(fields[i], values[i], spec.min, spec.max)
 		if err != nil {
 			return false, fmt.Errorf("cannot parse %s field %q: %w", spec.name, fields[i], err)
 		}
 		if !matched {
-			return false, nil
+			allMatched = false
 		}
 	}
-	return true, nil
+	return allMatched, nil
 }
 
 // ValidateCronSchedule checks that a schedule has the right field count and

@@ -438,6 +438,23 @@ func TestCronScheduleMatchesAtRanges(t *testing.T) {
 	}
 }
 
+// TestCronScheduleMatchesAtReportsLaterMalformedField pins the doc-comment
+// contract: a field the matcher cannot read is an error even when an earlier
+// field already missed, so a broken schedule can never read as merely not due.
+func TestCronScheduleMatchesAtReportsLaterMalformedField(t *testing.T) {
+	// Minute "0" misses at :30, and the day-of-week field behind it is garbage.
+	const schedule = "0 * * * abc"
+	at := time.Date(2026, 3, 4, 16, 30, 0, 0, time.UTC)
+
+	got, err := CronScheduleMatchesAt(strings.Fields(schedule), at)
+	if err == nil {
+		t.Fatalf("CronScheduleMatchesAt(%q, %v) = %v, nil; want an error naming the malformed field", schedule, at, got)
+	}
+	if !strings.Contains(err.Error(), "day-of-week") {
+		t.Errorf("error = %q, want it to name the day-of-week field", err)
+	}
+}
+
 // TestCheckCronRangeSchedule proves the reported schedule now reaches the
 // runtime trigger, not just the parser.
 func TestCheckCronRangeSchedule(t *testing.T) {
