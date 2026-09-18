@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 const (
@@ -122,7 +123,8 @@ func (c *DoltLogSizeCheck) CanFix() bool { return false }
 func (c *DoltLogSizeCheck) Fix(_ *CheckContext) error { return nil }
 
 func doltLogFixHint(logFile string) string {
-	return fmt.Sprintf("archive it, then truncate in place (the server appends, so : > %s is safe while it runs)", logFile)
+	return fmt.Sprintf("archive it, then truncate in place (the server appends, so : > %s is safe while it runs)",
+		shellquote.Join([]string{logFile}))
 }
 
 // resolveManagedDoltLogFile mirrors the layout cmd/gc uses to start the

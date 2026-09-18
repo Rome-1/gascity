@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 func TestDoltLogSizeCheck_Skipped(t *testing.T) {
@@ -153,5 +154,25 @@ func TestDoltLogSizeCheck_CannotFix(t *testing.T) {
 	}
 	if err := c.Fix(&CheckContext{}); err != nil {
 		t.Errorf("Fix() = %v, want nil", err)
+	}
+}
+
+// TestDoltLogSizeCheck_FixHintIsShellSafe pins the remediation hint as
+// copy-pasteable: the path is interpolated into a shell redirect, so a
+// directory containing a space must come back quoted.
+func TestDoltLogSizeCheck_FixHintIsShellSafe(t *testing.T) {
+	dir := setupManagedDoltCity(t)
+	logPath := filepath.Join(t.TempDir(), "my city", "dolt.log")
+	writeFakeFile(t, logPath, 1024)
+	t.Setenv("GC_DOLT_LOG_FILE", logPath)
+	t.Setenv("GC_DOLT_LOG_WARN_BYTES", "512")
+
+	r := NewDoltLogSizeCheck(dir, false).Run(&CheckContext{})
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; msg = %s", r.Status, r.Message)
+	}
+	want := shellquote.Join([]string{logPath})
+	if !strings.Contains(r.FixHint, want) {
+		t.Errorf("FixHint = %q, want it to contain the shell-safe path %q", r.FixHint, want)
 	}
 }
